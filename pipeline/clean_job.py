@@ -1,0 +1,127 @@
+"""
+PySpark cleaning job: raw Yelp JSON → enriched reviews Parquet.
+
+Steps:
+  1. Read business.json + review.json
+  2. Drop nulls on key columns; filter is_open == 1
+  3. Join reviews ← businesses on business_id
+  4. Add recency_weight = 1 / (1 + days_since_review / 365)
+  5. Add grid_cell = "<lat_bucket>_<lng_bucket>" (0.1-degree grid)
+  6. Write Parquet partitioned by city
+
+Usage (local):
+    spark-submit pipeline/clean_job.py \
+        --input data/sample/ --output data/processed/ --mode local
+
+Usage (EMR / S3):
+    spark-submit pipeline/clean_job.py \
+        --input s3://citybite/raw/ --output s3://citybite/processed/reviews_enriched/
+"""
+
+import argparse
+import math
+import os
+import sys
+from datetime import datetime
+
+from dotenv import load_dotenv
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType
+
+load_dotenv()
+
+REQUIRED_REVIEW_COLS = ["review_id", "business_id", "user_id", "stars", "date", "text"]
+REQUIRED_BUSINESS_COLS = ["business_id", "is_open", "name", "city", "state", "latitude", "longitude", "categories"]
+
+
+def build_spark(mode: str) -> SparkSession:
+    master = "local[*]" if mode == "local" else None
+    builder = SparkSession.builder.appName("CityBite-Clean")
+    if master:
+        builder = builder.master(master)
+    spark = builder.getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
+
+
+def read_json(spark: SparkSession, path: str, filename: str):
+    full_path = path.rstrip("/") + "/" + filename
+    return spark.read.json(full_path)
+
+
+def add_recency_weight(df, date_col: str = "date"):
+    today = datetime.now()
+    today_ts = F.lit(today.strftime("%Y-%m-%d"))
+    days_since = F.datediff(today_ts, F.to_date(F.col(date_col), "yyyy-MM-dd HH:mm:ss"))
+    return df.withColumn("recency_weight", F.lit(1.0) / (F.lit(1.0) + days_since.cast(DoubleType()) / F.lit(365.0)))
+
+
+def add_grid_cell(df, lat_col: str = "latitude", lng_col: str = "longitude"):
+    lat_bucket = F.floor(F.col(lat_col) / F.lit(0.1)) * F.lit(0.1)
+    lng_bucket = F.floor(F.col(lng_col) / F.lit(0.1)) * F.lit(0.1)
+    cell = F.concat(F.format_number(lat_bucket, 1), F.lit("_"), F.format_number(lng_bucket, 1))
+    return df.withColumn("grid_cell", cell)
+
+
+def clean_businesses(df):
+    return (
+        df.select(*REQUIRED_BUSINESS_COLS)
+          .dropna(subset=["business_id", "latitude", "longitude"])
+          .filter(F.col("is_open") == 1)
+    )
+
+
+def clean_reviews(df):
+    return (
+        df.select(*REQUIRED_REVIEW_COLS)
+          .dropna(subset=REQUIRED_REVIEW_COLS)
+    )
+
+
+def build_enriched(reviews, businesses):
+    joined = reviews.join(businesses, on="business_id", how="inner")
+    with_recency = add_recency_weight(joined)
+    return add_grid_cell(with_recency)
+
+
+def write_output(df, output_path: str, mode: str) -> None:
+    dest = output_path if mode != "local" else output_path.rstrip("/") + "/reviews_enriched"
+    print(f"Writing enriched reviews to {dest} ...")
+    (
+        df.write
+          .mode("overwrite")
+          .partitionBy("city")
+          .parquet(dest)
+    )
+    print("Write complete.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="CityBite PySpark cleaning job")
+    parser.add_argument("--input", required=True, help="Path to raw JSON files")
+    parser.add_argument("--output", required=True, help="Output path for enriched Parquet")
+    parser.add_argument("--mode", choices=["local", "emr"], default="local")
+    args = parser.parse_args()
+
+    spark = build_spark(args.mode)
+
+    print("Reading business data ...")
+    raw_businesses = read_json(spark, args.input, "yelp_academic_dataset_business.json")
+    businesses = clean_businesses(raw_businesses)
+    print(f"  Open businesses: {businesses.count():,}")
+
+    print("Reading review data ...")
+    raw_reviews = read_json(spark, args.input, "yelp_academic_dataset_review.json")
+    reviews = clean_reviews(raw_reviews)
+    print(f"  Clean reviews: {reviews.count():,}")
+
+    enriched = build_enriched(reviews, businesses)
+    print(f"  Enriched rows: {enriched.count():,}")
+
+    write_output(enriched, args.output, args.mode)
+    spark.stop()
+
+
+if __name__ == "__main__":
+    main()
