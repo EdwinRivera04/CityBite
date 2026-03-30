@@ -24,7 +24,7 @@ load_dotenv()
 DEFAULTS = {
     "instance_class": "db.t3.micro",
     "engine": "postgres",
-    "engine_version": "15.4",
+    "engine_version": "15.7",
     "allocated_storage": 20,        # GB (minimum)
     "backup_retention": 1,          # day (minimum to stay free)
     "multi_az": False,              # single-AZ saves ~50%

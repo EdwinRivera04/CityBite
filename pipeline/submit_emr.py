@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-S3_BUCKET = os.getenv("S3_BUCKET", "citybite")
+S3_BUCKET = os.getenv("S3_BUCKET", "citybite-560580021963")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 SCRIPT_BASE = f"s3://{S3_BUCKET}/scripts"
 

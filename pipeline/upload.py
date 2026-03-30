@@ -100,7 +100,7 @@ def upload_directory(source_dir: Path, bucket: str, prefix: str) -> tuple[int, i
 def main() -> None:
     parser = argparse.ArgumentParser(description="Upload Yelp data to S3 raw zone")
     parser.add_argument("--source", required=True, help="Local source directory")
-    parser.add_argument("--bucket", default=os.getenv("S3_BUCKET", "citybite"))
+    parser.add_argument("--bucket", default=os.getenv("S3_BUCKET", "citybite-560580021963"))
     parser.add_argument("--prefix", default="raw/", help="S3 key prefix")
     args = parser.parse_args()
 
