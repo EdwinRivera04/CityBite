@@ -23,6 +23,7 @@ import math
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 
 from dotenv import load_dotenv
 from pyspark.sql import SparkSession
@@ -33,6 +34,32 @@ load_dotenv()
 
 REQUIRED_REVIEW_COLS = ["review_id", "business_id", "user_id", "stars", "date", "text"]
 REQUIRED_BUSINESS_COLS = ["business_id", "is_open", "name", "city", "state", "latitude", "longitude", "categories"]
+
+
+def validate_windows_local_hadoop(mode: str) -> None:
+    if mode != "local" or os.name != "nt":
+        return
+
+    hadoop_home = os.getenv("HADOOP_HOME") or os.getenv("hadoop.home.dir")
+    if not hadoop_home:
+        raise RuntimeError(
+            "Windows local Spark requires HADOOP_HOME (or hadoop.home.dir). "
+            "Set it to a folder containing bin/winutils.exe and bin/hadoop.dll."
+        )
+
+    bin_dir = Path(hadoop_home) / "bin"
+    missing = []
+    for filename in ("winutils.exe", "hadoop.dll"):
+        candidate = bin_dir / filename
+        if not candidate.exists():
+            missing.append(str(candidate))
+
+    if missing:
+        raise RuntimeError(
+            "Windows Hadoop binaries are incomplete. Missing required file(s): "
+            f"{', '.join(missing)}. Ensure both winutils.exe and hadoop.dll are present "
+            "under HADOOP_HOME/bin and come from a compatible Hadoop 3.x build."
+        )
 
 
 def build_spark(mode: str) -> SparkSession:
@@ -87,13 +114,29 @@ def build_enriched(reviews, businesses):
 
 def write_output(df, output_path: str, mode: str) -> None:
     dest = output_path if mode != "local" else output_path.rstrip("/") + "/reviews_enriched"
-    print(f"Writing enriched reviews to {dest} ...")
-    (
-        df.write
-          .mode("overwrite")
-          .partitionBy("city")
-          .parquet(dest)
-    )
+    print(f"Writing enriched reviews to {dest}...")
+    try:
+        (
+            df.write
+              .mode("overwrite")
+              .partitionBy("city")
+              .parquet(dest)
+        )
+    except Exception as e:
+        error_text = str(e)
+        if os.name == "nt" and "HADOOP_HOME and hadoop.home.dir are unset" in error_text:
+            raise RuntimeError(
+                "Spark local write failed on Windows because winutils.exe is not configured. "
+                "Install a Hadoop winutils binary and set HADOOP_HOME to its parent folder "
+                "(which must contain bin/winutils.exe), then rerun this job."
+            ) from e
+        if os.name == "nt" and "NativeIO$Windows.access0" in error_text:
+            raise RuntimeError(
+                "Spark local write failed on Windows due to Hadoop native library mismatch. "
+                "Make sure HADOOP_HOME/bin contains BOTH winutils.exe and hadoop.dll from "
+                "the same Hadoop 3.x build, then reopen terminal and rerun."
+            ) from e
+        raise
     print("Write complete.")
 
 
@@ -103,6 +146,8 @@ def main() -> None:
     parser.add_argument("--output", required=True, help="Output path for enriched Parquet")
     parser.add_argument("--mode", choices=["local", "emr"], default="local")
     args = parser.parse_args()
+
+    validate_windows_local_hadoop(args.mode)
 
     spark = build_spark(args.mode)
 
