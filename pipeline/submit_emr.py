@@ -60,6 +60,50 @@ JOB_CONFIGS: dict[str, dict] = {
             "--skip-jdbc",
         ],
     },
+    "setup": {
+        "name": "CityBite-Setup",
+        "script": None,  # uses raw command, not spark-submit
+        # Install via both pip3 and python3 -m pip to cover whichever Python
+        # PYSPARK_PYTHON resolves to on this EMR release (they differ on EMR 7.x).
+        "args": [
+            "bash", "-c",
+            "sudo pip3 install numpy pandas sqlalchemy psycopg2-binary"
+            " && sudo python3 -m pip install numpy pandas sqlalchemy psycopg2-binary"
+            " 2>/dev/null; true",
+        ],
+    },
+    "als": {
+        "name": "CityBite-ALS",
+        "script": f"{SCRIPT_BASE}/als_train.py",
+        "conf": {
+            "spark.kryoserializer.buffer.max": "512m",
+            "spark.driver.memory": "4g",
+            "spark.executor.memory": "4g",
+            # Pin the Python used by the driver, YARN app master, and executors
+            # to python3 so they all share the same site-packages as the setup step.
+            "spark.pyspark.python": "python3",
+            "spark.yarn.appMasterEnv.PYSPARK_PYTHON": "python3",
+        },
+        "args": [
+            "--input", f"s3://{S3_BUCKET}/processed/",
+            "--mode", "emr",
+        ],
+    },
+    "sentiment": {
+        "name": "CityBite-Sentiment",
+        "script": f"{SCRIPT_BASE}/sentiment.py",
+        "conf": {
+            "spark.kryoserializer.buffer.max": "512m",
+            "spark.driver.memory": "4g",
+            "spark.executor.memory": "4g",
+            "spark.pyspark.python": "python3",
+            "spark.yarn.appMasterEnv.PYSPARK_PYTHON": "python3",
+        },
+        "args": [
+            "--input", f"s3://{S3_BUCKET}/processed/",
+            "--mode", "emr",
+        ],
+    },
 }
 
 
@@ -72,31 +116,81 @@ def build_emr_client() -> boto3.client:
     )
 
 
+BOOTSTRAP_SCRIPT_S3 = f"s3://{S3_BUCKET}/scripts/bootstrap.sh"
+
+
 def upload_scripts(jobs: list[str]) -> None:
-    local_map = {"clean": "pipeline/clean_job.py", "aggregate": "pipeline/aggregate_job.py"}
+    local_map = {
+        "clean":     "pipeline/clean_job.py",
+        "aggregate": "pipeline/aggregate_job.py",
+        "als":       "ml/als_train.py",
+        "sentiment": "ml/sentiment.py",
+    }
     s3 = boto3.client("s3", region_name=AWS_REGION)
+
+    # Always upload the bootstrap script
+    bootstrap_local = "infra/bootstrap.sh"
+    if os.path.exists(bootstrap_local):
+        s3.upload_file(bootstrap_local, S3_BUCKET, "scripts/bootstrap.sh")
+        print(f"  Uploading {bootstrap_local} -> s3://{S3_BUCKET}/scripts/bootstrap.sh")
+
     for job in jobs:
-        local_path = local_map[job]
+        local_path = local_map.get(job)
+        if not local_path:
+            continue  # no script to upload (e.g. setup)
         if not os.path.exists(local_path):
             print(f"WARNING: {local_path} not found locally — using existing S3 version.")
             continue
         s3_key = f"scripts/{local_path.split('/')[-1]}"
-        print(f"  Uploading {local_path} → s3://{S3_BUCKET}/{s3_key}")
+        print(f"  Uploading {local_path} -> s3://{S3_BUCKET}/{s3_key}")
         s3.upload_file(local_path, S3_BUCKET, s3_key)
 
 
-def _build_step(job: str) -> dict:
+def _build_step(job: str, inject_env: bool = False) -> dict:
+    """
+    Build an EMR step dict for the given job.
+
+    inject_env=True wraps the spark-submit call in 'bash -c "export ... && spark-submit ..."'
+    so that RDS_* env vars are available to the driver on clusters that were NOT launched by
+    submit_emr.py (e.g. manually created clusters that lack the Configurations block).
+    """
     config = JOB_CONFIGS[job]
-    spark_args = ["spark-submit", "--deploy-mode", "client"]
-    if "packages" in config:
-        spark_args += ["--packages", config["packages"]]
-    spark_args += [config["script"]] + config["args"]
+
+    if config.get("script") is None:
+        # Raw shell command step (e.g. setup/pip install)
+        args = config["args"]
+    else:
+        spark_args = ["spark-submit", "--deploy-mode", "client"]
+        if "packages" in config:
+            spark_args += ["--packages", config["packages"]]
+        for k, v in config.get("conf", {}).items():
+            spark_args += ["--conf", f"{k}={v}"]
+        spark_args += [config["script"]] + config["args"]
+
+        if inject_env:
+            # Build env-var export prefix for clusters without Configurations block.
+            env_pairs = {
+                "PYSPARK_PYTHON": "python3",   # ensure driver uses same Python as setup step
+                "RDS_HOST":     os.environ.get("RDS_HOST", ""),
+                "RDS_PORT":     os.environ.get("RDS_PORT", "5432"),
+                "RDS_DB":       os.environ.get("RDS_DB", "citybite"),
+                "RDS_USER":     os.environ.get("RDS_USER", ""),
+                "RDS_PASSWORD": os.environ.get("RDS_PASSWORD", ""),
+            }
+            exports = " && ".join(
+                f"export {k}={v}" for k, v in env_pairs.items() if v
+            )
+            shell_cmd = exports + " && " + " ".join(spark_args)
+            args = ["bash", "-c", shell_cmd]
+        else:
+            args = spark_args
+
     return {
         "Name": config["name"],
         "ActionOnFailure": "TERMINATE_CLUSTER",  # fail fast on transient clusters
         "HadoopJarStep": {
             "Jar": "command-runner.jar",
-            "Args": spark_args,
+            "Args": args,
         },
     }
 
@@ -112,6 +206,31 @@ def launch_transient_cluster(emr: boto3.client, jobs: list[str]) -> str:
         Applications=[{"Name": "Spark"}],
         LogUri=CLUSTER_CONFIG["log_uri"],
 
+        BootstrapActions=[
+            {
+                "Name": "Install Python dependencies",
+                "ScriptBootstrapAction": {
+                    "Path": BOOTSTRAP_SCRIPT_S3,
+                },
+            }
+        ],
+        Configurations=[
+            {
+                "Classification": "spark-env",
+                "Configurations": [
+                    {
+                        "Classification": "export",
+                        "Properties": {k: v for k, v in {
+                            "RDS_HOST":     os.environ.get("RDS_HOST", ""),
+                            "RDS_PORT":     os.environ.get("RDS_PORT", "5432"),
+                            "RDS_DB":       os.environ.get("RDS_DB", "citybite"),
+                            "RDS_USER":     os.environ.get("RDS_USER", "citybite_user"),
+                            "RDS_PASSWORD": os.environ.get("RDS_PASSWORD", ""),
+                        }.items() if v},
+                    }
+                ],
+            }
+        ],
         Instances={
             "KeepJobFlowAliveWhenNoSteps": False,   # ← auto-terminate when done
             "TerminationProtected": False,
@@ -151,7 +270,7 @@ def launch_transient_cluster(emr: boto3.client, jobs: list[str]) -> str:
 
 
 def add_step_to_cluster(emr: boto3.client, cluster_id: str, job: str) -> str:
-    step = _build_step(job)
+    step = _build_step(job, inject_env=True)
     step["ActionOnFailure"] = "CONTINUE"  # don't kill a persistent cluster on failure
     resp = emr.add_job_flow_steps(JobFlowId=cluster_id, Steps=[step])
     step_id = resp["StepIds"][0]

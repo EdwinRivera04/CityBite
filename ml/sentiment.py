@@ -21,13 +21,16 @@ import argparse
 import os
 import sqlite3
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # not available on EMR — env vars set via cluster Configurations
+
 import pandas as pd
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from sqlalchemy import create_engine
-
-load_dotenv()
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 _LOCAL_DB = os.path.join(_PROJECT_ROOT, "data", "citybite_local.db")
@@ -215,7 +218,7 @@ def write_sentiment(sentiment_pd: pd.DataFrame, db_url: str, mode: str) -> None:
     if mode == "local":
         ensure_local_table()
 
-    engine = create_engine(db_url)
+    engine = create_engine(db_url, pool_pre_ping=True, pool_recycle=3600)
     sentiment_pd.to_sql(
         name="grid_sentiment",
         con=engine,

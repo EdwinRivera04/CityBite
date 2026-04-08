@@ -214,5 +214,6 @@ CLAUDE.md
 downloaded_data/
 Yelp-JSON.zip
 data/raw/
+data/gold/
 data/processed/
 *.db

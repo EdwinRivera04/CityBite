@@ -22,7 +22,12 @@ Usage (EMR / S3):
 import argparse
 import os
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # not available on EMR — env vars set via cluster Configurations
+
 from pyspark.ml import Pipeline
 from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.ml.feature import StringIndexer
@@ -30,8 +35,6 @@ from pyspark.ml.recommendation import ALS
 from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-
-load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -231,21 +234,18 @@ def generate_recommendations(
         )
     )
 
-    rows = recs_exploded.collect()
+    # Use toPandas() + vectorized map instead of collect() + Python loop.
+    # collect() on 1.8M users × 10 recs = 18M rows iterates row-by-row in
+    # Python and hangs. toPandas() uses Arrow-based transfer and pandas .map()
+    # is vectorized — orders of magnitude faster on large datasets.
+    recs_pd = recs_exploded.toPandas()
+    recs_pd["user_id"] = recs_pd["user_idx"].map(user_map)
+    recs_pd["business_id"] = recs_pd["business_idx"].map(biz_map)
+    recs_pd = recs_pd.dropna(subset=["user_id", "business_id"])
+    recs_pd["predicted_rating"] = recs_pd["predicted_rating"].astype(float)
+    recs_pd["rank"] = recs_pd["rank"].astype(int)
 
-    records = []
-    for row in rows:
-        user_id = user_map.get(row.user_idx)
-        biz_id = biz_map.get(row.business_idx)
-        if user_id and biz_id:
-            records.append({
-                "user_id": user_id,
-                "business_id": biz_id,
-                "predicted_rating": float(row.predicted_rating),
-                "rank": int(row.rank),
-            })
-
-    return pd.DataFrame(records)
+    return recs_pd[["user_id", "business_id", "predicted_rating", "rank"]]
 
 
 # ---------------------------------------------------------------------------
@@ -282,14 +282,16 @@ def write_recommendations(recs_pd, db_url: str) -> None:
     """
     from sqlalchemy import create_engine
 
-    engine = create_engine(db_url)
+    # pool_pre_ping re-tests the connection before use — guards against the
+    # PostgreSQL idle-timeout kicking in while Spark compute is running.
+    engine = create_engine(db_url, pool_pre_ping=True, pool_recycle=3600)
     recs_pd.to_sql(
         name="als_recommendations",
         con=engine,
         if_exists="replace",   # full refresh; keeps schema simple
         index=False,
         method="multi",        # batch inserts for speed
-        chunksize=5000,
+        chunksize=10000,
     )
     print(f"  Wrote {len(recs_pd):,} recommendation rows to {db_url}")
 

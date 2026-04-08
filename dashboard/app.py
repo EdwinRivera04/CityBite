@@ -1,11 +1,11 @@
 """
-CityBite Streamlit Dashboard — Folium heatmap + ALS recommendations.
+CityBite Streamlit Dashboard — Folium heatmap + restaurant pins + ALS recommendations.
 
 Layout:
-  Sidebar  — city selector, cuisine filter, user ID for personalized recs
-  Main     — Folium map: one CircleMarker per grid cell, radius ∝ popularity
+  Sidebar  — city selector, cuisine filter, user ID
+  Left     — Folium map: rectangle tile per grid cell + recommendation pins
   Right    — Top-10 ALS recommendations for the selected user
-  Bottom   — Neighborhood sentiment bar chart (grid_sentiment table)
+  Bottom   — Neighborhood sentiment bar chart
 
 Local dev:  reads from data/citybite_local.db (SQLite)
 Production: reads from RDS PostgreSQL via env vars (RDS_HOST, etc.)
@@ -14,7 +14,9 @@ Run:
     streamlit run dashboard/app.py
 """
 
+import math
 import os
+from collections import Counter
 
 import folium
 import pandas as pd
@@ -22,7 +24,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
-from streamlit_folium import st_folium
 
 load_dotenv()
 
@@ -47,13 +48,7 @@ _LOCAL_DB = os.path.join(_PROJECT_ROOT, "data", "citybite_local.db")
 
 @st.cache_resource
 def get_engine():
-    """
-    Return a SQLAlchemy engine.
-
-    Falls back to local SQLite if RDS_HOST is not set, so the app works
-    out-of-the-box in local dev without any AWS credentials.
-    """
-    rds_host = os.environ.get("RDS_HOST")
+    rds_host = os.environ.get("RDS_HOST", "").strip()
     if rds_host:
         user = os.environ["RDS_USER"]
         pw = os.environ["RDS_PASSWORD"]
@@ -62,7 +57,6 @@ def get_engine():
         url = f"postgresql+psycopg2://{user}:{pw}@{rds_host}:{port}/{db}"
     else:
         url = f"sqlite:///{_LOCAL_DB}"
-
     return create_engine(url)
 
 
@@ -70,45 +64,42 @@ def get_engine():
 # Cached data loaders
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=3600, show_spinner="Loading grid data ...")
-def load_grid_data(city: str) -> pd.DataFrame:
-    """Load grid_aggregates for the selected city from the database."""
-    engine = get_engine()
-    with engine.connect() as conn:
-        df = pd.read_sql(
-            text("SELECT * FROM grid_aggregates WHERE city = :city"),
-            conn,
-            params={"city": city},
-        )
-    return df
-
-
-@st.cache_data(ttl=3600, show_spinner="Loading city list ...")
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_cities() -> list[str]:
-    """Return the sorted list of cities present in business_scores."""
-    engine = get_engine()
-    with engine.connect() as conn:
-        df = pd.read_sql(
-            text("SELECT DISTINCT city FROM business_scores ORDER BY city"),
-            conn,
-        )
-    return df["city"].tolist()
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            df = pd.read_sql(
+                text("SELECT DISTINCT city FROM business_scores ORDER BY city"), conn
+            )
+        return df["city"].tolist()
+    except Exception as e:
+        st.error(f"Could not load cities: {e}. Make sure the pipeline has run.")
+        return []
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading businesses ...")
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_grid_data(city: str) -> pd.DataFrame:
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            df = pd.read_sql(
+                text("SELECT * FROM grid_aggregates WHERE city = :city"),
+                conn, params={"city": city},
+            )
+        return df
+    except Exception as e:
+        st.error(f"Could not load grid data: {e}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_businesses(city: str, cuisine_filter: str | None) -> pd.DataFrame:
-    """
-    Load business_scores for a city, optionally filtered by cuisine keyword.
-
-    The categories column is free-text (e.g. "Mexican, Restaurants") so we
-    use a LIKE/ILIKE search rather than an exact match.
-    """
     engine = get_engine()
-    # Build query — SQLite uses LIKE (case-insensitive by default for ASCII)
     if cuisine_filter and cuisine_filter != "All":
         query = text(
             "SELECT * FROM business_scores "
-            "WHERE city = :city AND categories LIKE :cat "
+            "WHERE city = :city AND LOWER(categories) LIKE LOWER(:cat) "
             "ORDER BY popularity_score DESC"
         )
         params = {"city": city, "cat": f"%{cuisine_filter}%"}
@@ -118,139 +109,364 @@ def load_businesses(city: str, cuisine_filter: str | None) -> pd.DataFrame:
             "ORDER BY popularity_score DESC"
         )
         params = {"city": city}
+    try:
+        with engine.connect() as conn:
+            return pd.read_sql(query, conn, params=params)
+    except Exception as e:
+        st.error(f"Could not load businesses: {e}")
+        return pd.DataFrame()
 
-    with engine.connect() as conn:
-        return pd.read_sql(query, conn, params=params)
 
-
-@st.cache_data(ttl=3600, show_spinner="Loading recommendations ...")
-def load_recommendations(user_id: str) -> pd.DataFrame:
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_recommendations(user_id: str, city: str) -> tuple[pd.DataFrame, bool]:
     """
-    Load top-10 ALS recommendations for a specific user.
+    Load top-10 ALS recommendations, preferring the selected city.
 
-    Joins with business_scores to surface name, city, and cuisine alongside
-    the predicted rating — avoids a second round-trip in the UI layer.
+    Returns (df, city_filtered) where city_filtered=True means the results
+    are specific to the selected city. Falls back to cross-city results if
+    no recommendations exist for the user in that city.
     """
     engine = get_engine()
-    query = text(
-        """
+    base_select = """
         SELECT r.rank, r.predicted_rating,
-               b.name, b.city, b.categories, b.avg_rating, b.review_count
+               b.name, b.city, b.categories, b.avg_rating, b.review_count,
+               b.latitude, b.longitude
         FROM   als_recommendations r
-        JOIN   business_scores     b ON r.business_id = b.business_id
+        JOIN   business_scores b ON r.business_id = b.business_id
         WHERE  r.user_id = :uid
-        ORDER  BY r.rank
-        """
-    )
-    with engine.connect() as conn:
-        return pd.read_sql(query, conn, params={"uid": user_id})
+    """
+    city_query = text(base_select + " AND b.city = :city ORDER BY r.rank")
+    all_query  = text(base_select + " ORDER BY r.rank LIMIT 10")
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(city_query, conn, params={"uid": user_id, "city": city})
+            if not df.empty:
+                return df, True
+            df = pd.read_sql(all_query, conn, params={"uid": user_id})
+            return df, False
+    except Exception as e:
+        st.error(f"Could not load recommendations: {e}")
+        return pd.DataFrame(), False
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading sentiment ...")
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_sentiment(city: str) -> pd.DataFrame:
-    """
-    Load grid_sentiment joined with grid_aggregates so we can label each
-    grid cell by its city and sort by sentiment score.
-    """
     engine = get_engine()
-    query = text(
-        """
+    query = text("""
         SELECT s.grid_cell, s.sentiment_score, s.positive_count, s.negative_count,
                g.center_lat, g.center_lng, g.restaurant_count
         FROM   grid_sentiment  s
         JOIN   grid_aggregates g ON s.grid_cell = g.grid_cell
         WHERE  g.city = :city
         ORDER  BY s.sentiment_score DESC
-        """
-    )
-    with engine.connect() as conn:
-        return pd.read_sql(query, conn, params={"city": city})
+    """)
+    try:
+        with engine.connect() as conn:
+            return pd.read_sql(query, conn, params={"city": city})
+    except Exception as e:
+        st.error(f"Could not load sentiment data: {e}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_cuisines_for_city(city: str) -> list[str]:
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            df = pd.read_sql(
+                text("SELECT categories FROM business_scores WHERE city = :city"),
+                conn, params={"city": city},
+            )
+        return sorted({
+            tag.strip()
+            for cats in df["categories"].dropna()
+            for tag in cats.split(",")
+            if tag.strip()
+        })
+    except Exception:
+        return []
+        import streamlit as st
+
+
+# ---------------------------------------------------------------------------
+# Neighborhood naming
+# ---------------------------------------------------------------------------
+
+def _grid_cell_to_label(grid_cell: str, city_lat: float, city_lng: float) -> str:
+    """
+    Convert a grid_cell key like '35.2_-115.0' to a compass-direction
+    neighborhood label (e.g. 'North District', 'Downtown', 'Southeast Side').
+    """
+    try:
+        lat_s, lng_s = grid_cell.split("_")
+        lat = float(lat_s) + 0.05   # shift to cell center
+        lng = float(lng_s) + 0.05
+    except ValueError:
+        return grid_cell
+
+    dlat = lat - city_lat
+    dlng = lng - city_lng
+    dist = math.sqrt(dlat ** 2 + dlng ** 2)
+
+    if dist < 0.1:
+        return "Downtown"
+
+    # atan2(dlat, dlng) gives angle from East; convert to bearing from North
+    bearing = (90 - math.degrees(math.atan2(dlat, dlng))) % 360
+    if bearing < 22.5 or bearing >= 337.5:
+        direction = "North"
+    elif bearing < 67.5:
+        direction = "Northeast"
+    elif bearing < 112.5:
+        direction = "East"
+    elif bearing < 157.5:
+        direction = "Southeast"
+    elif bearing < 202.5:
+        direction = "South"
+    elif bearing < 247.5:
+        direction = "Southwest"
+    elif bearing < 292.5:
+        direction = "West"
+    else:
+        direction = "Northwest"
+
+    if dist < 0.25:
+        suffix = "District"
+    elif dist < 0.45:
+        suffix = "Side"
+    else:
+        suffix = "Outskirts"
+
+    return f"{direction} {suffix}"
+
+
+def add_neighborhood_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add a 'neighborhood' column to any DataFrame that has
+    grid_cell, center_lat, and center_lng columns. Disambiguates duplicate
+    labels by appending a number.
+    """
+    if df.empty or "grid_cell" not in df.columns:
+        return df
+
+    city_lat = df["center_lat"].mean()
+    city_lng = df["center_lng"].mean()
+
+    raw = [_grid_cell_to_label(gc, city_lat, city_lng) for gc in df["grid_cell"]]
+
+    seen_count: Counter = Counter(raw)
+    seen_index: Counter = Counter()
+    labels = []
+    for label in raw:
+        if seen_count[label] > 1:
+            seen_index[label] += 1
+            labels.append(f"{label} {seen_index[label]}")
+        else:
+            labels.append(label)
+
+    out = df.copy()
+    out["neighborhood"] = labels
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Map builder
 # ---------------------------------------------------------------------------
 
-# Color thresholds for circle marker fill
 _HIGH_SCORE = 0.7
-_MED_SCORE = 0.4
+_MED_SCORE  = 0.4
 
 
-def _popularity_color(score: float) -> str:
-    """Map a normalized popularity score to a traffic-light color."""
-    if score >= _HIGH_SCORE:
-        return "#e53935"    # red   — hotspot
-    if score >= _MED_SCORE:
-        return "#fb8c00"    # orange — moderate
-    return "#43a047"        # green  — low activity
+def _score_color(norm: float) -> str:
+    """Traffic-light color from a normalized [0,1] popularity score."""
+    if norm >= _HIGH_SCORE:
+        return "#c62828"   # deep red — hotspot
+    if norm >= _MED_SCORE:
+        return "#ef6c00"   # amber — moderate
+    return "#2e7d32"       # green — quiet
 
 
-def build_heatmap(grid_df: pd.DataFrame) -> folium.Map:
+def build_map(
+    grid_df: pd.DataFrame,
+    businesses_df: pd.DataFrame | None = None,
+    recs_df: pd.DataFrame | None = None,
+) -> folium.Map:
     """
-    Build a Folium map with one CircleMarker per grid cell.
+    Build a Folium map.
 
-    Radius scales with avg_popularity (capped so extreme values don't
-    swamp the map).  Color encodes the same score in three bands.
+    Popularity is shown as a smooth HeatMap gradient (blue -> yellow -> red).
+    Invisible rectangles sit on top to provide hover tooltips and click popups
+    without interfering with the visual layer.
+    When businesses_df is provided, top restaurant pins are added for the
+    currently selected city and cuisine filter.
+    When recs_df is provided, numbered blue pin markers are added at each
+    recommended business location.
     """
+    from folium.plugins import HeatMap, MarkerCluster
+
     center_lat = grid_df["center_lat"].mean()
     center_lng = grid_df["center_lng"].mean()
 
-    # Use explicit HTTPS tile URLs and a provider fallback to avoid blank
-    # basemaps when one tile source is blocked or unavailable.
     m = folium.Map(
         location=[center_lat, center_lng],
-        zoom_start=12,
-        tiles=None,
+        zoom_start=11,
+        tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+        attr=(
+            '&copy; <a href="https://www.openstreetmap.org/copyright">'
+            'OpenStreetMap</a> contributors &copy; '
+            '<a href="https://carto.com/attributions">CARTO</a>'
+        ),
         control_scale=True,
     )
-
-    folium.TileLayer(
-        tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-        attr='&copy; OpenStreetMap contributors &copy; CARTO',
-        name="CartoDB Positron",
-        max_zoom=20,
-        subdomains="abcd",
-        show=True,
-    ).add_to(m)
-
-    folium.TileLayer(
-        tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-        attr='&copy; OpenStreetMap contributors',
-        name="OpenStreetMap",
-        max_zoom=19,
-        show=False,
-    ).add_to(m)
-
-    # Normalize scores to [0, 1] relative to this city's range so radius
-    # is visually consistent regardless of absolute score values
     max_score = grid_df["avg_popularity"].max() or 1.0
     min_score = grid_df["avg_popularity"].min()
     score_range = max(max_score - min_score, 1e-6)
 
-    for _, row in grid_df.iterrows():
-        norm = (row["avg_popularity"] - min_score) / score_range
-        radius = 6 + norm * 20      # radius in pixels: 6 (low) → 26 (high)
-        color = _popularity_color(norm)
+    grid_df = add_neighborhood_labels(grid_df)
 
+    heat_data = [
+        [
+            row["center_lat"],
+            row["center_lng"],
+            (row["avg_popularity"] - min_score) / score_range,
+        ]
+        for _, row in grid_df.iterrows()
+    ]
+    HeatMap(
+        heat_data,
+        min_opacity=0.35,
+        radius=55,
+        blur=40,
+        max_zoom=15,
+        gradient={
+            0.0: "#313695",
+            0.25: "#74add1",
+            0.5: "#fee090",
+            0.75: "#f46d43",
+            1.0: "#a50026",
+        },
+    ).add_to(m)
+
+    if businesses_df is not None and not businesses_df.empty:
+        cluster = MarkerCluster(name="Restaurants").add_to(m)
+        for _, biz in businesses_df.head(30).iterrows():
+            try:
+                lat_b = float(biz["latitude"])
+                lng_b = float(biz["longitude"])
+            except (TypeError, ValueError):
+                continue
+            if math.isnan(lat_b) or math.isnan(lng_b):
+                continue
+
+            score = float(biz.get("popularity_score", 0.0) or 0.0)
+            if score >= _HIGH_SCORE:
+                icon_color = "red"
+            elif score >= _MED_SCORE:
+                icon_color = "orange"
+            else:
+                icon_color = "green"
+
+            popup_html = (
+                f"<div style='font-family:sans-serif;min-width:190px'>"
+                f"<b style='font-size:14px'>{biz['name']}</b><br>"
+                f"<span style='color:#555'>{biz['categories']}</span><br>"
+                f"Rating: <b>{float(biz['avg_rating']):.1f}</b> · "
+                f"{int(biz['review_count']):,} reviews<br>"
+                f"Popularity score: <b>{score:.2f}</b>"
+                f"</div>"
+            )
+
+            folium.Marker(
+                location=[lat_b, lng_b],
+                popup=folium.Popup(popup_html, max_width=230),
+                tooltip=biz["name"],
+                icon=folium.Icon(color=icon_color, icon="cutlery", prefix="fa"),
+            ).add_to(cluster)
+
+    for _, row in grid_df.iterrows():
+        try:
+            lat = float(row["grid_cell"].split("_")[0])
+            lng = float(row["grid_cell"].split("_")[1])
+        except (ValueError, IndexError):
+            lat = row["center_lat"] - 0.05
+            lng = row["center_lng"] - 0.05
+
+        hood = row["neighborhood"]
         popup_html = (
-            f"<b>{row['top_cuisine']}</b><br>"
-            f"Popularity: {row['avg_popularity']:.2f}<br>"
-            f"Restaurants: {row['restaurant_count']}<br>"
-            f"Grid: {row['grid_cell']}"
+            f"<div style='font-family:sans-serif;min-width:160px'>"
+            f"<b style='font-size:14px'>{hood}</b><br>"
+            f"<span style='color:#555'>{row['top_cuisine']}</span>"
+            f"<hr style='margin:6px 0'>"
+            f"Popularity score: <b>{row['avg_popularity']:.2f}</b><br>"
+            f"Restaurants: <b>{row['restaurant_count']}</b>"
+            f"</div>"
         )
 
-        folium.CircleMarker(
-            location=[row["center_lat"], row["center_lng"]],
-            radius=radius,
-            color=color,
+        folium.Rectangle(
+            bounds=[[lat, lng], [lat + 0.1, lng + 0.1]],
+            color="transparent",
+            weight=0,
             fill=True,
-            fill_color=color,
-            fill_opacity=0.65,
-            popup=folium.Popup(popup_html, max_width=220),
-            tooltip=f"{row['top_cuisine']} | Score: {row['avg_popularity']:.2f}",
+            fill_color="white",
+            fill_opacity=0.01,
+            popup=folium.Popup(popup_html, max_width=200),
+            tooltip=f"{hood}  |  score {row['avg_popularity']:.2f}  ({row['restaurant_count']} restaurants)",
         ).add_to(m)
 
-    folium.LayerControl(collapsed=True).add_to(m)
+    if recs_df is not None and not recs_df.empty:
+        for _, rec in recs_df.iterrows():
+            try:
+                lat_r = float(rec["latitude"])
+                lng_r = float(rec["longitude"])
+            except (TypeError, ValueError):
+                continue
+            if math.isnan(lat_r) or math.isnan(lng_r):
+                continue
+
+            stars = "★" * min(round(float(rec["avg_rating"])), 5)
+            popup_html = (
+                f"<div style='font-family:sans-serif;min-width:190px'>"
+                f"<b style='font-size:14px'>#{int(rec['rank'])}. {rec['name']}</b><br>"
+                f"<span style='color:#f9a825'>{stars}</span> "
+                f"{rec['avg_rating']:.1f} ({rec['review_count']:,} reviews)<br>"
+                f"<span style='color:#555;font-size:12px'>{rec['categories']}</span><br>"
+                f"<b style='color:#1565c0'>Predicted: {rec['predicted_rating']:.1f} ★</b>"
+                f"</div>"
+            )
+
+            folium.Marker(
+                location=[lat_r, lng_r],
+                popup=folium.Popup(popup_html, max_width=230),
+                tooltip=f"#{int(rec['rank'])} {rec['name']}",
+                icon=folium.DivIcon(
+                    html=(
+                        f'<div style="background:#1565c0;color:white;border-radius:50%;'
+                        f'width:26px;height:26px;text-align:center;line-height:26px;'
+                        f'font-weight:bold;font-size:11px;border:2px solid white;'
+                        f'box-shadow:0 2px 6px rgba(0,0,0,0.45)">'
+                        f'{int(rec["rank"])}'
+                        f'</div>'
+                    ),
+                    icon_size=(26, 26),
+                    icon_anchor=(13, 13),
+                ),
+            ).add_to(m)
+
+    legend_html = (
+        "<div style='position:fixed;bottom:28px;right:10px;z-index:9999;"
+        "background:white;padding:10px 14px;border-radius:8px;"
+        "box-shadow:0 2px 8px rgba(0,0,0,0.18);font-family:sans-serif;"
+        "font-size:12px;line-height:2'>"
+        "<b>Popularity</b><br>"
+        "<span style='background:#c62828;display:inline-block;width:12px;"
+        "height:12px;border-radius:2px;margin-right:6px'></span>High<br>"
+        "<span style='background:#ef6c00;display:inline-block;width:12px;"
+        "height:12px;border-radius:2px;margin-right:6px'></span>Medium<br>"
+        "<span style='background:#2e7d32;display:inline-block;width:12px;"
+        "height:12px;border-radius:2px;margin-right:6px'></span>Low"
+        "</div>"
+    )
+    m.get_root().html.add_child(folium.Element(legend_html))
 
     return m
 
@@ -259,167 +475,186 @@ def build_heatmap(grid_df: pd.DataFrame) -> folium.Map:
 # UI — sidebar
 # ---------------------------------------------------------------------------
 
-def render_sidebar() -> tuple[str, str, str, str]:
-    """
-    Render sidebar controls and return
-    (selected_city, cuisine_filter, user_id, map_renderer).
-    """
-    st.sidebar.title("CityBite")
+def render_sidebar() -> tuple[str, str, str]:
+    """Render sidebar and return (selected_city, cuisine_filter, user_id)."""
+    st.sidebar.title("🍽️ CityBite")
     st.sidebar.caption("Restaurant popularity intelligence")
-    st.sidebar.markdown("---")
+    st.sidebar.divider()
 
     cities = load_cities()
     if not cities:
-        st.sidebar.error("No cities found in database. Run seed_local_db.py first.")
+        st.sidebar.error("No cities found. Run the pipeline first.")
         st.stop()
 
     selected_city = st.sidebar.selectbox("City", cities, index=0)
 
-    # Cuisine filter — derive options from business data for the city
-    biz_df = load_businesses(selected_city, None)
-    all_cuisines = sorted(
-        {
-            tag.strip()
-            for cats in biz_df["categories"].dropna()
-            for tag in cats.split(",")
-        }
-    )
-    cuisine_options = ["All"] + all_cuisines
-    cuisine_filter = st.sidebar.selectbox("Cuisine", cuisine_options, index=0)
+    all_cuisines = _load_cuisines_for_city(selected_city)
+    cuisine_filter = st.sidebar.selectbox("Cuisine", ["All"] + all_cuisines, index=0)
 
-    st.sidebar.markdown("---")
+    st.sidebar.divider()
     user_id = st.sidebar.text_input(
-        "User ID (for personalized recs)",
-        placeholder="Enter a Yelp user_id ...",
+        "Yelp User ID",
+        placeholder="Paste user_id for personalized picks ...",
+        help="Enter a Yelp user_id to see your top-10 restaurant recommendations pinned on the map.",
     )
 
-    st.sidebar.markdown("---")
-    map_renderer = st.sidebar.radio(
-        "Map renderer",
-        options=["Auto", "Raw HTML fallback"],
-        index=0,
-        help="Use Raw HTML fallback if map markers show but basemap tiles are blank.",
+    st.sidebar.divider()
+    st.sidebar.markdown(
+        "**Map key**\n\n"
+        "🟥 High popularity &nbsp; 🟧 Moderate &nbsp; 🟩 Low\n\n"
+        "🔵 Numbered pins = your recommendations"
     )
 
-    st.sidebar.markdown("---")
-    st.sidebar.info(
-        "Heatmap colors:\n"
-        "- 🔴 High popularity\n"
-        "- 🟠 Moderate\n"
-        "- 🟢 Low activity"
-    )
-
-    return selected_city, cuisine_filter, user_id, map_renderer
+    return selected_city, cuisine_filter, user_id
 
 
 # ---------------------------------------------------------------------------
-# UI — main content
+# UI — main panels
 # ---------------------------------------------------------------------------
 
-def render_map_panel(city: str, cuisine_filter: str, map_renderer: str) -> None:
-    """Render the Folium map in the main content area."""
+def render_map_panel(city: str, cuisine_filter: str, user_id: str) -> None:
+    """Render the popularity heatmap with optional recommendation pins."""
+
     grid_df = load_grid_data(city)
 
     if grid_df.empty:
-        st.warning(f"No grid data for {city}. Run seed_local_db.py to populate the DB.")
+        st.warning(f"No grid data for {city}. Run the pipeline to populate the DB.")
         return
 
-    st.subheader(f"Restaurant Popularity Map — {city}")
-    m = build_heatmap(grid_df)
-    # Primary renderer is st_folium. A manual fallback is provided for
-    # environments where the custom component sandbox blocks tile loading.
-    if map_renderer == "Raw HTML fallback":
-        components.html(m._repr_html_(), height=520, scrolling=False)
-    else:
-        try:
-            st_folium(m, width=None, height=500, use_container_width=True, returned_objects=[])
-        except Exception:
-            components.html(m._repr_html_(), height=520, scrolling=False)
+    recs_df: pd.DataFrame | None = None
+    if user_id:
+        recs_df, _ = load_recommendations(user_id, city)
+        if recs_df is not None and recs_df.empty:
+            recs_df = None
 
-    # Summary metrics below the map
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Grid cells", len(grid_df))
-    col2.metric("Total restaurants", int(grid_df["restaurant_count"].sum()))
-    col3.metric(
-        "Avg popularity",
-        f"{grid_df['avg_popularity'].mean():.2f}",
-    )
+    biz_df = load_businesses(city, cuisine_filter)
+    m = build_map(grid_df, biz_df, recs_df)
 
-    # Filtered business table
-    with st.expander(f"Top businesses in {city} — {cuisine_filter}", expanded=False):
+    # Render as a self-contained HTML iframe.  st_folium intercepts tile-layer
+    # requests and only activates them after a user clicks the layer control,
+    # leaving the basemap blank on first load.  components.html embeds the full
+    # Folium map HTML directly — tiles load immediately without any interaction.
+    components.html(m._repr_html_(), height=520, scrolling=False)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Neighborhoods", len(grid_df))
+    c2.metric("Total restaurants", f"{int(grid_df['restaurant_count'].sum()):,}")
+    c3.metric("Avg popularity score", f"{grid_df['avg_popularity'].mean():.2f}")
+
+    label = f"Top restaurants — {city}"
+    if cuisine_filter != "All":
+        label += f" · {cuisine_filter}"
+
+    with st.expander(label, expanded=False):
         biz_df = load_businesses(city, cuisine_filter)
         if biz_df.empty:
             st.info("No businesses match the current filter.")
         else:
-            display_cols = [
-                "name", "categories", "avg_rating",
-                "review_count", "popularity_score", "grid_cell",
-            ]
             st.dataframe(
-                biz_df[display_cols].head(50),
+                biz_df[
+                    ["name", "categories", "avg_rating", "review_count", "popularity_score"]
+                ].head(50).rename(columns={
+                    "name": "Name",
+                    "categories": "Cuisine",
+                    "avg_rating": "Avg Rating",
+                    "review_count": "Reviews",
+                    "popularity_score": "Score",
+                }),
                 use_container_width=True,
                 hide_index=True,
             )
 
 
-def render_recommendations_panel(user_id: str) -> None:
-    """Render personalized ALS recommendations in the right column."""
-    st.subheader("Personalized Recommendations")
+def render_recommendations_panel(user_id: str, city: str) -> None:
+    """Render the personalized ALS recommendations list."""
+    st.subheader("Top Picks For You")
 
     if not user_id:
-        st.info("Enter a User ID in the sidebar to see your top-10 picks.")
-        return
-
-    recs_df = load_recommendations(user_id)
-
-    if recs_df.empty:
-        st.warning(
-            f"No recommendations found for user `{user_id}`. "
-            "Run `spark-submit ml/als_train.py` to generate them."
+        st.info(
+            "Enter your Yelp User ID in the sidebar to see personalized "
+            "restaurant recommendations pinned on the map."
         )
         return
 
+    recs_df, city_filtered = load_recommendations(user_id, city)
+
+    if recs_df.empty:
+        st.warning(
+            f"No recommendations found for `{user_id}`. "
+            "Run the ALS training job to generate them."
+        )
+        return
+
+    if city_filtered:
+        st.caption(f"Your top picks in **{city}** — pinned on the map")
+    else:
+        st.caption(
+            f"No picks found in {city} — showing your top picks across all cities"
+        )
+
     for _, row in recs_df.iterrows():
-        with st.container():
+        rating = float(row["avg_rating"])
+        full  = min(round(rating), 5)
+        empty = 5 - full
+        stars = "★" * full + "☆" * empty
+
+        predicted = float(row["predicted_rating"])
+        match_pct = min(int(predicted / 5 * 100), 100)
+
+        with st.container(border=True):
             st.markdown(
-                f"**{row['rank']}. {row['name']}** &nbsp; "
-                f"{'⭐' * round(row['avg_rating'])} "
-                f"({row['avg_rating']:.1f} avg, {row['review_count']:,} reviews)"
+                f"**#{int(row['rank'])}.** {row['name']}",
             )
-            st.caption(
-                f"{row['categories']} · {row['city']} · "
-                f"Predicted: {row['predicted_rating']:.2f} ★"
+            st.markdown(
+                f"<span style='color:#f9a825;font-size:16px'>{stars}</span> "
+                f"<span style='color:#555'>{rating:.1f} &nbsp;·&nbsp; "
+                f"{int(row['review_count']):,} reviews</span>",
+                unsafe_allow_html=True,
             )
-            st.markdown("---")
+            st.caption(f"{row['categories']}  ·  {row['city']}")
+            st.progress(match_pct / 100, text=f"Match score: {predicted:.1f} / 5")
 
 
 def render_sentiment_panel(city: str) -> None:
-    """Render per-neighborhood sentiment bar chart at the bottom of the page."""
+    """Render per-neighborhood sentiment bar chart."""
     sentiment_df = load_sentiment(city)
 
     if sentiment_df.empty:
         st.info(
-            "No sentiment data yet. Run `spark-submit ml/sentiment.py` to populate."
+            "No sentiment data yet. Run the sentiment job to populate."
         )
         return
 
-    st.subheader(f"Neighborhood Sentiment — {city}")
+    sentiment_df = add_neighborhood_labels(sentiment_df)
 
-    # Bar chart using Streamlit's built-in chart (no extra dependencies)
+    st.subheader(f"Neighborhood Sentiment — {city}")
+    st.caption(
+        "Share of positive reviews (4–5 stars) per neighborhood. "
+        "Higher = more satisfied diners."
+    )
+
     chart_df = (
         sentiment_df
-        .set_index("grid_cell")[["sentiment_score"]]
+        .set_index("neighborhood")[["sentiment_score"]]
         .sort_values("sentiment_score", ascending=False)
-        .head(20)           # cap at 20 cells so the chart is readable
+        .head(20)
     )
-    st.bar_chart(chart_df, height=300)
+    st.bar_chart(chart_df, height=280)
 
-    with st.expander("Sentiment detail table", expanded=False):
+    with st.expander("Full sentiment breakdown", expanded=False):
+        display = sentiment_df[
+            ["neighborhood", "sentiment_score", "positive_count",
+             "negative_count", "restaurant_count"]
+        ].copy()
+        display["sentiment_score"] = display["sentiment_score"].map("{:.1%}".format)
         st.dataframe(
-            sentiment_df[
-                ["grid_cell", "sentiment_score", "positive_count",
-                 "negative_count", "restaurant_count"]
-            ],
+            display.rename(columns={
+                "neighborhood": "Neighborhood",
+                "sentiment_score": "Positive Rate",
+                "positive_count": "Positive Reviews",
+                "negative_count": "Negative Reviews",
+                "restaurant_count": "Restaurants",
+            }),
             use_container_width=True,
             hide_index=True,
         )
@@ -430,18 +665,20 @@ def render_sentiment_panel(city: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    selected_city, cuisine_filter, user_id, map_renderer = render_sidebar()
+    selected_city, cuisine_filter, user_id = render_sidebar()
 
-    # Two-column layout: map (wider) | recommendations
-    left_col, right_col = st.columns([3, 1])
+    st.title(f"🍽️ {selected_city}")
+    st.divider()
+
+    left_col, right_col = st.columns([3, 2])
 
     with left_col:
-        render_map_panel(selected_city, cuisine_filter, map_renderer)
+        render_map_panel(selected_city, cuisine_filter, user_id)
 
     with right_col:
-        render_recommendations_panel(user_id)
+        render_recommendations_panel(user_id, selected_city)
 
-    st.markdown("---")
+    st.divider()
     render_sentiment_panel(selected_city)
 
 
