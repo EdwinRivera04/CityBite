@@ -29,7 +29,7 @@ from pathlib import Path
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType, StringType
+from pyspark.sql.types import BooleanType, DoubleType, StringType
 
 try:
     from dotenv import load_dotenv
@@ -38,6 +38,27 @@ except ImportError:
     pass  # not available on EMR — paths come from CLI args
 
 METRO_RADIUS_KM = 50.0
+
+# Yelp top-level and common subcategory tags that indicate a food/drink business.
+# A business passes if ANY of its comma-split category tags (lowercased) is in this set.
+# This excludes Active Life, Auto, Beauty & Spas, Arts & Entertainment, etc.
+FOOD_DRINK_ANCHORS: frozenset = frozenset([
+    # Yelp "Restaurants" parent + all cuisine subcategories fall under this tag
+    "restaurants",
+    # Yelp "Food" parent — covers bakeries, delis, coffee, grocery, specialty food, etc.
+    "food",
+    # Drink establishments not always tagged "Restaurants"
+    "bars", "pubs", "sports bars", "dive bars", "cocktail bars", "wine bars",
+    "breweries", "brewpubs", "wineries", "distilleries",
+    # Coffee / tea / juice — sometimes standalone without "Food" parent
+    "coffee & tea", "cafes", "juice bars & smoothies", "bubble tea",
+    # Dessert / sweet spots sometimes standalone
+    "desserts", "ice cream & frozen yogurt", "bakeries", "patisserie/cake shop",
+    # Other common standalone food tags
+    "food trucks", "food stands", "caterers", "personal chefs",
+    "diners", "fast food", "pizza", "burgers", "sandwiches", "sushi bars",
+    "steakhouses", "seafood", "buffets", "creperies", "waffles",
+])
 
 REQUIRED_REVIEW_COLS = ["review_id", "business_id", "user_id", "stars", "date", "text"]
 REQUIRED_BUSINESS_COLS = [
@@ -152,13 +173,21 @@ def add_grid_cell(df, lat_col: str = "latitude", lng_col: str = "longitude"):
     return df.withColumn("grid_cell", cell)
 
 
+_is_food_udf = F.udf(
+    lambda cats: bool(
+        cats and {t.strip().lower() for t in cats.split(",")} & FOOD_DRINK_ANCHORS
+    ),
+    BooleanType(),
+)
+
+
 def clean_businesses(df, spark, radius_km: float = METRO_RADIUS_KM):
-    # Step 1: select required columns, drop bad rows, filter open restaurants only
+    # Step 1: select required columns, drop bad rows, keep only food/drink businesses
     cleaned = (
         df.select(*REQUIRED_BUSINESS_COLS)
           .dropna(subset=["business_id", "latitude", "longitude"])
           .filter(F.col("is_open") == 1)
-          .filter(F.col("categories").contains("Restaurants"))
+          .filter(_is_food_udf(F.col("categories")))
     )
     # Step 2: normalize capitalization so "las vegas" == "Las Vegas"
     cleaned = (

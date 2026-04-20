@@ -50,10 +50,17 @@ def sample_businesses(spark):
         {"business_id": "b4", "name": "No Coords",    "city": "Phoenix",   "state": "AZ",
          "latitude": None, "longitude": None, "is_open": 1,
          "categories": "Unknown, Restaurants", "review_count": 10},
-        # non-restaurant → should be filtered
+        # non-food businesses → should be filtered out
         {"business_id": "b5", "name": "Car Wash",     "city": "Phoenix",   "state": "AZ",
          "latitude": 33.47, "longitude": -112.09, "is_open": 1,
          "categories": "Auto Detailing", "review_count": 30},
+        {"business_id": "b6", "name": "Yoga Studio",  "city": "Phoenix",   "state": "AZ",
+         "latitude": 33.48, "longitude": -112.10, "is_open": 1,
+         "categories": "Active Life, Yoga", "review_count": 20},
+        # bar — no "Restaurants" tag but should be kept via allowlist
+        {"business_id": "b7", "name": "The Tap Room",  "city": "Phoenix",   "state": "AZ",
+         "latitude": 33.49, "longitude": -112.11, "is_open": 1,
+         "categories": "Bars, Nightlife", "review_count": 60},
     ])
 
 
@@ -83,12 +90,18 @@ class TestCleanBusinesses:
         ids = {r.business_id for r in result.collect()}
         assert "b4" not in ids
 
-    def test_filters_non_restaurants(self, spark, sample_businesses):
+    def test_filters_non_food_businesses(self, spark, sample_businesses):
         result = clean_businesses(sample_businesses, spark)
         ids = {r.business_id for r in result.collect()}
-        assert "b5" not in ids
+        assert "b5" not in ids  # Auto Detailing
+        assert "b6" not in ids  # Yoga Studio
 
-    def test_keeps_open_restaurants(self, spark, sample_businesses):
+    def test_keeps_bars_without_restaurants_tag(self, spark, sample_businesses):
+        result = clean_businesses(sample_businesses, spark)
+        ids = {r.business_id for r in result.collect()}
+        assert "b7" in ids  # Bars, Nightlife — kept via allowlist
+
+    def test_keeps_open_food_businesses(self, spark, sample_businesses):
         result = clean_businesses(sample_businesses, spark)
         ids = {r.business_id for r in result.collect()}
         assert {"b1", "b3"}.issubset(ids)

@@ -191,6 +191,12 @@ def load_sentiment(city: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+_META_TAGS = frozenset([
+    "restaurants", "food", "bars", "nightlife", "grocery",
+    "specialty food", "imported food", "ethnic grocery",
+])
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_cuisines_for_city(city: str) -> list[str]:
     try:
@@ -204,11 +210,10 @@ def _load_cuisines_for_city(city: str) -> list[str]:
             tag.strip()
             for cats in df["categories"].dropna()
             for tag in cats.split(",")
-            if tag.strip()
+            if tag.strip() and tag.strip().lower() not in _META_TAGS
         })
     except Exception:
         return []
-        import streamlit as st
 
 
 # ---------------------------------------------------------------------------
