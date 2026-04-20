@@ -156,6 +156,12 @@ def write_to_rds(df) -> None:
     out = pandas_df[cols].dropna(subset=["business_id"]).copy()
     out["review_count"] = out["review_count"].astype(int)
 
+    # Strip tabs/newlines from text fields so psycopg2 COPY doesn't break
+    for col in ("name", "metro_area", "city", "profile_text"):
+        out[col] = out[col].fillna("").str.replace("\t", " ", regex=False) \
+                                      .str.replace("\n", " ", regex=False) \
+                                      .str.replace("\r", " ", regex=False)
+
     buf = io.StringIO()
     out.to_csv(buf, sep="\t", index=False, header=False, na_rep="\\N")
     buf.seek(0)
