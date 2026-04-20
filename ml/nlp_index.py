@@ -120,25 +120,53 @@ def write_to_sqlite(df, db_path: str) -> None:
 
 
 def write_to_rds(df) -> None:
-    from sqlalchemy import create_engine
-
-    host = os.environ["RDS_HOST"]
-    port = os.environ.get("RDS_PORT", "5432")
-    db   = os.environ["RDS_DB"]
-    user = os.environ["RDS_USER"]
-    pw   = os.environ["RDS_PASSWORD"]
-    engine = create_engine(f"postgresql+psycopg2://{user}:{pw}@{host}:{port}/{db}")
+    import io
+    import psycopg2
 
     pandas_df = df.toPandas()
-    pandas_df.to_sql(
-        "business_profiles",
-        con=engine,
-        if_exists="replace",
-        index=False,
-        method="multi",
-        chunksize=500,
+
+    conn = psycopg2.connect(
+        host=os.environ["RDS_HOST"],
+        port=int(os.environ.get("RDS_PORT", "5432")),
+        dbname=os.environ["RDS_DB"],
+        user=os.environ["RDS_USER"],
+        password=os.environ["RDS_PASSWORD"],
+        connect_timeout=30,
     )
-    print(f"  Wrote {len(pandas_df):,} rows → business_profiles (RDS)")
+    cur = conn.cursor()
+
+    cur.execute("DROP TABLE IF EXISTS business_profiles")
+    cur.execute("""
+        CREATE TABLE business_profiles (
+            business_id      VARCHAR(50) PRIMARY KEY,
+            name             TEXT,
+            metro_area       VARCHAR(100),
+            city             VARCHAR(100),
+            latitude         FLOAT,
+            longitude        FLOAT,
+            avg_rating       FLOAT,
+            review_count     INT,
+            popularity_score FLOAT,
+            profile_text     TEXT
+        )
+    """)
+
+    cols = ["business_id", "name", "metro_area", "city",
+            "latitude", "longitude", "avg_rating", "review_count",
+            "popularity_score", "profile_text"]
+    out = pandas_df[cols].dropna(subset=["business_id"]).copy()
+    out["review_count"] = out["review_count"].astype(int)
+
+    buf = io.StringIO()
+    out.to_csv(buf, sep="\t", index=False, header=False, na_rep="\\N")
+    buf.seek(0)
+    cur.copy_from(buf, "business_profiles", sep="\t", null="\\N", columns=cols)
+
+    cur.execute("CREATE INDEX idx_profiles_metro ON business_profiles(metro_area)")
+    conn.commit()
+    cur.close()
+    conn.close()
+    print(f"  Wrote {len(out):,} rows → business_profiles via psycopg2 COPY")
 
 
 def main() -> None:
