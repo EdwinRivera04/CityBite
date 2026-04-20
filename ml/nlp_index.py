@@ -37,14 +37,11 @@ _REVIEW_SAMPLE = 20
 _SNIPPET_LEN = 120
 
 
-def build_spark() -> SparkSession:
-    spark = (
-        SparkSession.builder
-        .appName("CityBite-NLPIndex")
-        .master("local[*]")
-        .config("spark.sql.shuffle.partitions", "4")
-        .getOrCreate()
-    )
+def build_spark(mode: str) -> SparkSession:
+    builder = SparkSession.builder.appName("CityBite-NLPIndex")
+    if mode == "local":
+        builder = builder.master("local[*]").config("spark.sql.shuffle.partitions", "4")
+    spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
     return spark
 
@@ -176,7 +173,7 @@ def main() -> None:
     parser.add_argument("--mode", choices=["local", "emr"], default="local")
     args = parser.parse_args()
 
-    spark = build_spark()
+    spark = build_spark(args.mode)
 
     print("Building business profiles ...")
     profiles = build_profiles(spark, args.input)
