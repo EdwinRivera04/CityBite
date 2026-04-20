@@ -21,12 +21,14 @@ Usage (EMR):
 import argparse
 import os
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # not installed on EMR
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType
-
-load_dotenv()
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 _LOCAL_DB = os.path.join(_PROJECT_ROOT, "data", "citybite_local.db")
