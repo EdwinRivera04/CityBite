@@ -156,9 +156,10 @@ def write_to_rds(df) -> None:
     out = pandas_df[cols].dropna(subset=["business_id"]).copy()
     out["review_count"] = out["review_count"].astype(int)
 
-    # Strip tabs/newlines from text fields so psycopg2 COPY doesn't break
+    # Sanitize text fields — backslash, tab, newline all corrupt psycopg2 COPY
     for col in ("name", "metro_area", "city", "profile_text"):
-        out[col] = out[col].fillna("").str.replace("\t", " ", regex=False) \
+        out[col] = out[col].fillna("").str.replace("\\", "", regex=False) \
+                                      .str.replace("\t", " ", regex=False) \
                                       .str.replace("\n", " ", regex=False) \
                                       .str.replace("\r", " ", regex=False)
 
