@@ -209,6 +209,100 @@ def find_proxy_user(city: str, cuisines: tuple) -> str | None:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_profiles(city: str) -> pd.DataFrame:
+    """
+    Load business profiles for NLP search.
+
+    Tries business_profiles first (rich profiles with review text).
+    Falls back to business_scores.categories when the NLP index hasn't been
+    run for this metro area — so search works everywhere immediately.
+    """
+    engine = get_engine()
+
+    # Try rich profiles table first
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(
+                text(
+                    "SELECT business_id, name, city, latitude, longitude, "
+                    "avg_rating, review_count, popularity_score, profile_text "
+                    "FROM business_profiles WHERE metro_area = :city"
+                ),
+                conn, params={"city": city},
+            )
+        if not df.empty:
+            return df
+    except Exception:
+        pass  # table missing or query failed — fall through to fallback
+
+    # Fallback: build profile_text from categories stored in business_scores
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(
+                text(
+                    "SELECT business_id, name, city, latitude, longitude, "
+                    "avg_rating, review_count, popularity_score, categories AS profile_text "
+                    "FROM business_scores WHERE metro_area = :city"
+                ),
+                conn, params={"city": city},
+            )
+        if not df.empty:
+            # Weight categories 3× to mirror what nlp_index.py does
+            df["profile_text"] = df["profile_text"].fillna("").apply(
+                lambda c: f"{c} {c} {c}".strip()
+            )
+        return df
+    except Exception as e:
+        st.error(f"Could not load profiles: {e}")
+        return pd.DataFrame()
+
+
+def nlp_search(query: str, profiles_df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
+    """
+    Return the top_n businesses whose profile_text best matches the query
+    using TF-IDF cosine similarity.
+    """
+    if profiles_df.empty or not query.strip():
+        return pd.DataFrame()
+
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+        import numpy as np
+    except ImportError:
+        st.error("scikit-learn is required for NLP search. Run: pip install scikit-learn")
+        return pd.DataFrame()
+
+    corpus = profiles_df["profile_text"].fillna("").tolist()
+    vectorizer = TfidfVectorizer(
+        max_features=20_000,
+        ngram_range=(1, 2),
+        min_df=1,
+        sublinear_tf=True,
+    )
+    tfidf_matrix = vectorizer.fit_transform(corpus)
+    query_vec = vectorizer.transform([query])
+    tfidf_scores = cosine_similarity(query_vec, tfidf_matrix).flatten()
+
+    # Blend: 60% TF-IDF relevance + 25% log-popularity + 15% avg_rating
+    review_counts = profiles_df["review_count"].fillna(0).astype(float).values
+    log_pop = np.log1p(review_counts)
+    pop_norm = log_pop / (log_pop.max() or 1.0)
+
+    ratings = profiles_df["avg_rating"].fillna(0).astype(float).values
+    rating_norm = ratings / 5.0
+
+    scores = tfidf_scores * 0.6 + pop_norm * 0.25 + rating_norm * 0.15
+
+    # Only return results where the query actually matched something
+    top_idx = np.argsort(scores)[::-1][:top_n]
+    result = profiles_df.iloc[top_idx].copy()
+    result["match_score"] = tfidf_scores[top_idx]
+    result["final_score"] = scores[top_idx]
+    return result[result["match_score"] > 0].reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_sentiment(city: str) -> pd.DataFrame:
     engine = get_engine()
     query = text("""
@@ -229,9 +323,36 @@ def load_sentiment(city: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-_META_TAGS = frozenset([
-    "restaurants", "food", "bars", "nightlife", "grocery",
-    "specialty food", "imported food", "ethnic grocery",
+_CUISINE_ALLOWLIST: frozenset = frozenset([
+    # Cuisines by origin
+    "mexican", "italian", "chinese", "japanese", "thai", "indian", "french",
+    "mediterranean", "greek", "spanish", "vietnamese", "korean",
+    "american (traditional)", "american (new)", "southern", "cajun/creole",
+    "middle eastern", "latin american", "caribbean", "hawaiian", "filipino",
+    "taiwanese", "cantonese", "szechuan", "dim sum", "ethiopian", "african",
+    "german", "irish", "british", "turkish", "persian/iranian", "pakistani",
+    "portuguese", "scandinavian",
+    # Food types / styles
+    "pizza", "burgers", "sandwiches", "tacos", "sushi bars", "sushi", "ramen",
+    "steakhouses", "seafood", "barbeque", "chicken wings", "chicken shop",
+    "hot dogs", "cheesesteaks", "wraps", "salad", "soup", "poke", "waffles",
+    "creperies", "fondue", "tapas/small plates", "hot pot", "buffets",
+    "comfort food", "soul food", "gastropubs", "diners", "fast food",
+    "food trucks", "food stands", "caterers",
+    # Meal types
+    "breakfast & brunch", "brunch",
+    # Drink establishments
+    "wine bars", "cocktail bars", "sports bars", "dive bars", "pubs",
+    "breweries", "brewpubs", "wineries", "distilleries", "sake bars",
+    "whiskey bars", "beer gardens",
+    # Coffee / tea / juice
+    "coffee & tea", "cafes", "juice bars & smoothies", "bubble tea", "tea rooms",
+    # Desserts / bakeries
+    "desserts", "ice cream & frozen yogurt", "bakeries", "patisserie/cake shop",
+    "cupcakes", "donuts", "candy stores", "chocolatiers & shops", "gelato",
+    # Other specific food
+    "delis", "acai bowls", "empanadas", "falafel", "gyros", "kebab",
+    "noodles", "dumplings", "bagels", "fish & chips",
 ])
 
 
@@ -248,7 +369,7 @@ def _load_cuisines_for_city(city: str) -> list[str]:
             tag.strip()
             for cats in df["categories"].dropna()
             for tag in cats.split(",")
-            if tag.strip() and tag.strip().lower() not in _META_TAGS
+            if tag.strip() and tag.strip().lower() in _CUISINE_ALLOWLIST
         })
     except Exception:
         return []
@@ -715,18 +836,69 @@ def render_recommendations_panel(city: str, effective_user_id: str | None) -> No
         predicted = float(row["predicted_rating"])
         match_pct = min(int(predicted / 5 * 100), 100)
 
-        with st.container(border=True):
-            st.markdown(
-                f"**#{int(row['rank'])}.** {row['name']}",
-            )
-            st.markdown(
-                f"<span style='color:#f9a825;font-size:16px'>{stars}</span> "
-                f"<span style='color:#555'>{rating:.1f} &nbsp;·&nbsp; "
-                f"{int(row['review_count']):,} reviews</span>",
-                unsafe_allow_html=True,
-            )
-            st.caption(f"{row['categories']}  ·  {row['city']}")
-            st.progress(match_pct / 100, text=f"Match score: {predicted:.1f} / 5")
+        st.markdown(
+            f"<div style='border:1px solid #444;border-radius:8px;padding:10px 14px;margin-bottom:8px'>"
+            f"<b>#{int(row['rank'])}. {row['name']}</b><br>"
+            f"<span style='color:#f9a825;font-size:16px'>{stars}</span> "
+            f"<span style='color:#888'>{rating:.1f} &nbsp;·&nbsp; {int(row['review_count']):,} reviews</span><br>"
+            f"<span style='color:#aaa;font-size:12px'>{row['categories']} · {row['city']}</span><br>"
+            f"<div style='background:#333;border-radius:4px;height:6px;margin-top:6px'>"
+            f"<div style='background:#1565c0;width:{match_pct}%;height:6px;border-radius:4px'></div></div>"
+            f"<span style='color:#888;font-size:11px'>Match score: {predicted:.1f} / 5</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+
+def render_nlp_panel(city: str) -> None:
+    """Render the natural-language restaurant search panel."""
+    st.caption(
+        f"Describe what you're craving and we'll find the best match in **{city}**. "
+        "Try: *spicy ramen with great broth*, *outdoor patio brunch*, *authentic tacos*."
+    )
+
+    query = st.text_input(
+        "What are you looking for?",
+        placeholder="e.g. cozy Italian pasta with good wine...",
+        key="nlp_query",
+    )
+
+    if not query or not query.strip():
+        return
+
+    profiles_df = load_profiles(city)
+    if profiles_df.empty:
+        st.warning(f"No restaurant data found for {city}. Make sure the pipeline has run.")
+        return
+
+    with st.spinner("Searching..."):
+        results = nlp_search(query, profiles_df)
+
+    if results.empty:
+        st.info("No matches found. Try different keywords.")
+        return
+
+    st.markdown(f"**Top {len(results)} matches** for *\"{query}\"*")
+
+    for rank, (_, row) in enumerate(results.iterrows(), start=1):
+        rating = float(row.get("avg_rating") or 0.0)
+        full  = min(round(rating), 5)
+        stars = "★" * full + "☆" * (5 - full)
+        # final_score is already in [0,1] — show it directly so bars reflect true spread
+        match_pct = min(int(float(row["final_score"]) * 100), 100)
+
+        st.markdown(
+            f"<div style='border:1px solid #444;border-radius:8px;padding:10px 14px;margin-bottom:8px'>"
+            f"<b>#{rank}. {row['name']}</b><br>"
+            f"<span style='color:#f9a825;font-size:16px'>{stars}</span> "
+            f"<span style='color:#888'>{rating:.1f} &nbsp;·&nbsp; {int(row['review_count']):,} reviews</span><br>"
+            f"<span style='color:#aaa;font-size:12px'>{row['city']}</span><br>"
+            f"<div style='background:#333;border-radius:4px;height:6px;margin-top:6px'>"
+            f"<div style='background:#c62828;width:{match_pct}%;height:6px;border-radius:4px'></div></div>"
+            f"<span style='color:#888;font-size:11px'>Match: {match_pct}%</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def render_sentiment_panel(city: str) -> None:
@@ -810,13 +982,18 @@ def main() -> None:
         raw = st.session_state.get("rec_user_id_text", "") or ""
         effective_user_id = raw.strip() or None
 
-    tab_map, tab_recs, tab_sentiment = st.tabs(["Map", "Top Picks For You", "Neighborhood Sentiment"])
+    tab_map, tab_recs, tab_nlp, tab_sentiment = st.tabs(
+        ["Map", "Top Picks For You", "Describe What You Want", "Neighborhood Sentiment"]
+    )
 
     with tab_map:
         render_map_panel(selected_city, cuisine_filter, effective_user_id, pin_count)
 
     with tab_recs:
         render_recommendations_panel(selected_city, effective_user_id)
+
+    with tab_nlp:
+        render_nlp_panel(selected_city)
 
     with tab_sentiment:
         render_sentiment_panel(selected_city)

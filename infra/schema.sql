@@ -39,8 +39,22 @@ CREATE TABLE IF NOT EXISTS grid_sentiment (
     last_updated    TIMESTAMP DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_business_city   ON business_scores(city);
-CREATE INDEX IF NOT EXISTS idx_business_metro  ON business_scores(metro_area);
-CREATE INDEX IF NOT EXISTS idx_grid_metro      ON grid_aggregates(metro_area);
-CREATE INDEX IF NOT EXISTS idx_als_user        ON als_recommendations(user_id);
-CREATE INDEX IF NOT EXISTS idx_als_business  ON als_recommendations(business_id);
+CREATE TABLE IF NOT EXISTS business_profiles (
+    business_id      VARCHAR(50) PRIMARY KEY,
+    name             TEXT,
+    metro_area       VARCHAR(100),
+    city             VARCHAR(100),
+    latitude         FLOAT,
+    longitude        FLOAT,
+    avg_rating       FLOAT,
+    review_count     INT,
+    popularity_score FLOAT,
+    profile_text     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_business_city     ON business_scores(city);
+CREATE INDEX IF NOT EXISTS idx_business_metro    ON business_scores(metro_area);
+CREATE INDEX IF NOT EXISTS idx_grid_metro        ON grid_aggregates(metro_area);
+CREATE INDEX IF NOT EXISTS idx_als_user          ON als_recommendations(user_id);
+CREATE INDEX IF NOT EXISTS idx_als_business      ON als_recommendations(business_id);
+CREATE INDEX IF NOT EXISTS idx_profiles_metro    ON business_profiles(metro_area);

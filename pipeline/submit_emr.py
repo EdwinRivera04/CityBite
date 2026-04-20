@@ -57,7 +57,6 @@ JOB_CONFIGS: dict[str, dict] = {
             "--input", f"s3://{S3_BUCKET}/processed/reviews_enriched/",
             "--output", f"s3://{S3_BUCKET}/processed/",
             "--mode", "emr",
-            "--skip-jdbc",
         ],
     },
     "setup": {
@@ -104,6 +103,21 @@ JOB_CONFIGS: dict[str, dict] = {
             "--mode", "emr",
         ],
     },
+    "nlp": {
+        "name": "CityBite-NLP",
+        "script": f"{SCRIPT_BASE}/nlp_index.py",
+        "conf": {
+            "spark.kryoserializer.buffer.max": "512m",
+            "spark.driver.memory": "4g",
+            "spark.executor.memory": "4g",
+            "spark.pyspark.python": "python3",
+            "spark.yarn.appMasterEnv.PYSPARK_PYTHON": "python3",
+        },
+        "args": [
+            "--input", f"s3://{S3_BUCKET}/processed/",
+            "--mode", "emr",
+        ],
+    },
 }
 
 
@@ -125,6 +139,7 @@ def upload_scripts(jobs: list[str]) -> None:
         "aggregate": "pipeline/aggregate_job.py",
         "als":       "ml/als_train.py",
         "sentiment": "ml/sentiment.py",
+        "nlp":       "ml/nlp_index.py",
     }
     s3 = boto3.client("s3", region_name=AWS_REGION)
 

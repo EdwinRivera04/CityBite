@@ -24,7 +24,7 @@ load_dotenv()
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 _LOCAL_DB = os.path.join(_PROJECT_ROOT, "data", "citybite_local.db")
 
-TABLES = ["als_recommendations", "grid_sentiment"]
+TABLES = ["als_recommendations", "grid_sentiment", "business_profiles"]
 
 
 def main() -> None:

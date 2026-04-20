@@ -154,10 +154,24 @@ def _ensure_sqlite_schema(db_path: str) -> None:
         last_updated    TEXT DEFAULT (datetime('now'))
     );
 
-    CREATE INDEX IF NOT EXISTS idx_business_city   ON business_scores(city);
-    CREATE INDEX IF NOT EXISTS idx_business_metro  ON business_scores(metro_area);
-    CREATE INDEX IF NOT EXISTS idx_grid_metro      ON grid_aggregates(metro_area);
-    CREATE INDEX IF NOT EXISTS idx_als_user        ON als_recommendations(user_id);
+    CREATE TABLE IF NOT EXISTS business_profiles (
+        business_id      TEXT PRIMARY KEY,
+        name             TEXT,
+        metro_area       TEXT,
+        city             TEXT,
+        latitude         REAL,
+        longitude        REAL,
+        avg_rating       REAL,
+        review_count     INTEGER,
+        popularity_score REAL,
+        profile_text     TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_business_city     ON business_scores(city);
+    CREATE INDEX IF NOT EXISTS idx_business_metro    ON business_scores(metro_area);
+    CREATE INDEX IF NOT EXISTS idx_grid_metro        ON grid_aggregates(metro_area);
+    CREATE INDEX IF NOT EXISTS idx_als_user          ON als_recommendations(user_id);
+    CREATE INDEX IF NOT EXISTS idx_profiles_metro    ON business_profiles(metro_area);
     """
     conn = sqlite3.connect(db_path)
     conn.executescript(ddl)
