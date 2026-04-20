@@ -171,6 +171,44 @@ def load_recommendations(user_id: str, city: str) -> tuple[pd.DataFrame, bool]:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def find_proxy_user(city: str, cuisines: tuple) -> str | None:
+    """
+    Find the user whose ALS recommendations best match any of the given cuisines
+    in the selected city. Returns a user_id string or None if no match found.
+    cuisines must be a tuple (hashable) for st.cache_data.
+    """
+    if not cuisines:
+        return None
+    engine = get_engine()
+    # Build OR clause dynamically for each cuisine
+    cuisine_clauses = " OR ".join(
+        f"LOWER(b.categories) LIKE LOWER(:cat{i})" for i in range(len(cuisines))
+    )
+    query = text(f"""
+        SELECT r.user_id,
+               COUNT(*)                  AS matches,
+               AVG(r.predicted_rating)   AS avg_pred
+        FROM   als_recommendations r
+        JOIN   business_scores b ON r.business_id = b.business_id
+        WHERE  b.metro_area = :city
+          AND  ({cuisine_clauses})
+        GROUP  BY r.user_id
+        ORDER  BY matches DESC, avg_pred DESC
+        LIMIT  1
+    """)
+    params = {"city": city}
+    for i, c in enumerate(cuisines):
+        params[f"cat{i}"] = f"%{c}%"
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params=params)
+        return df["user_id"].iloc[0] if not df.empty else None
+    except Exception as e:
+        st.error(f"Could not find a matching taste profile: {e}")
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_sentiment(city: str) -> pd.DataFrame:
     engine = get_engine()
     query = text("""
@@ -503,9 +541,9 @@ def build_map(
 # UI — sidebar
 # ---------------------------------------------------------------------------
 
-def render_sidebar() -> tuple[str, str, str, int]:
-    """Render sidebar and return (selected_city, cuisine_filter, user_id, pin_count)."""
-    st.sidebar.markdown("## 🍽️ CityBite")
+def render_sidebar() -> tuple[str, str, int]:
+    """Render sidebar and return (city, cuisine_filter, pin_count)."""
+    st.sidebar.markdown("## CityBite")
     st.sidebar.caption("Restaurant popularity intelligence")
 
     cities = load_cities()
@@ -516,12 +554,6 @@ def render_sidebar() -> tuple[str, str, str, int]:
     selected_city = st.sidebar.selectbox("City", cities, index=0)
     all_cuisines = _load_cuisines_for_city(selected_city)
     cuisine_filter = st.sidebar.selectbox("Cuisine", ["All"] + all_cuisines, index=0)
-
-    user_id = st.sidebar.text_input(
-        "Yelp User ID",
-        placeholder="Paste user_id for personalized picks ...",
-        help="Enter a Yelp user_id to see your top-10 restaurant recommendations pinned on the map.",
-    )
 
     pin_count = st.sidebar.slider(
         "Pins on map",
@@ -534,11 +566,11 @@ def render_sidebar() -> tuple[str, str, str, int]:
 
     st.sidebar.markdown(
         "**Map key**  \n"
-        "🟥 High &nbsp; 🟧 Moderate &nbsp; 🟩 Low  \n"
-        "🔵 Your recommendations"
+        "🔴 High &nbsp; 🟠 Moderate &nbsp; 🟢 Low  \n"
+        "📍 Your recommendations"
     )
 
-    return selected_city, cuisine_filter, user_id, pin_count
+    return selected_city, cuisine_filter, pin_count
 
 
 # ---------------------------------------------------------------------------
@@ -615,30 +647,64 @@ def render_map_panel(city: str, cuisine_filter: str, user_id: str, pin_count: in
     components.html(map_html, height=600, scrolling=False)
 
 
-def render_recommendations_panel(user_id: str, city: str) -> None:
-    """Render the personalized ALS recommendations list."""
-    if not user_id:
-        st.info(
-            "Enter your Yelp User ID in the sidebar to see personalized "
-            "restaurant recommendations pinned on the map."
-        )
-        return
+def render_recommendations_panel(city: str, effective_user_id: str | None) -> None:
+    """Render recommendation controls and the ALS recommendations list."""
 
-    recs_df, city_filtered = load_recommendations(user_id, city)
+    # ── Mode toggle ────────────────────────────────────────────────────────
+    rec_mode = st.radio(
+        "Find picks by",
+        options=["cuisine", "user_id"],
+        format_func=lambda x: "Cuisine Taste" if x == "cuisine" else "Yelp User ID",
+        horizontal=True,
+        label_visibility="collapsed",
+        key="rec_mode",
+    )
+
+    # ── Input controls ─────────────────────────────────────────────────────
+    if rec_mode == "cuisine":
+        all_cuisines = _load_cuisines_for_city(city)
+        st.multiselect(
+            "Cuisine",
+            options=all_cuisines,
+            max_selections=3,
+            placeholder="Select up to 3 cuisines...",
+            label_visibility="collapsed",
+            key="rec_cuisines",
+        )
+        selected_cuisines = st.session_state.get("rec_cuisines", [])
+        if not selected_cuisines:
+            st.caption("Select up to 3 cuisines above to get taste-based recommendations.")
+            return
+        if not effective_user_id:
+            cuisine_str = ", ".join(selected_cuisines)
+            st.warning(f"No taste profile found for {cuisine_str} in {city}. Run the ALS training job to generate recommendations.")
+            return
+        cuisine_str = " + ".join(selected_cuisines)
+        st.caption(f"Top picks for **{cuisine_str}** lovers in **{city}** — pinned on the map")
+
+    else:
+        st.text_input(
+            "Yelp User ID",
+            placeholder="Paste user_id ...",
+            label_visibility="collapsed",
+            key="rec_user_id_text",
+        )
+        if not effective_user_id:
+            st.caption("Enter a Yelp User ID above to see personalized recommendations.")
+            return
+
+    # ── Recommendations list ───────────────────────────────────────────────
+    recs_df, city_filtered = load_recommendations(effective_user_id, city)
 
     if recs_df.empty:
-        st.warning(
-            f"No recommendations found for `{user_id}`. "
-            "Run the ALS training job to generate them."
-        )
+        st.warning("No recommendations found. Run the ALS training job to generate them.")
         return
 
-    if city_filtered:
-        st.caption(f"Your top picks in **{city}** — pinned on the map")
-    else:
-        st.caption(
-            f"No picks found in {city} — showing your top picks across all cities"
-        )
+    if rec_mode == "user_id":
+        if city_filtered:
+            st.caption(f"Your top picks in **{city}** — pinned on the map")
+        else:
+            st.caption(f"No picks found in {city} — showing your top picks across all cities")
 
     for _, row in recs_df.iterrows():
         rating = float(row["avg_rating"])
@@ -664,47 +730,65 @@ def render_recommendations_panel(user_id: str, city: str) -> None:
 
 
 def render_sentiment_panel(city: str) -> None:
-    """Render per-neighborhood sentiment bar chart."""
+    """Render per-neighborhood diner satisfaction scores."""
     sentiment_df = load_sentiment(city)
 
     if sentiment_df.empty:
-        st.info(
-            "No sentiment data yet. Run the sentiment job to populate."
-        )
+        st.info("No sentiment data yet. Run the sentiment job to populate.")
         return
 
-    sentiment_df = add_neighborhood_labels(sentiment_df)
+    # Use grid_df as the label source so neighborhood names match the map exactly
+    grid_df = load_grid_data(city)
+    labeled_grid = add_neighborhood_labels(grid_df)[["grid_cell", "neighborhood"]]
+    sentiment_df = sentiment_df.merge(labeled_grid, on="grid_cell", how="left")
 
-    st.caption(
-        "Share of positive reviews (4–5 stars) per neighborhood. "
-        "Higher = more satisfied diners."
-    )
+    # Bayesian-adjusted satisfaction: shrink low-volume neighborhoods toward the
+    # global average so a place with 3 five-star reviews doesn't rank above a
+    # busy neighborhood with thousands. k=30 means ~30 reviews of "prior" weight.
+    total_pos = sentiment_df["positive_count"].sum()
+    total_rev = (sentiment_df["positive_count"] + sentiment_df["negative_count"]).sum()
+    global_rate = total_pos / total_rev if total_rev > 0 else 0.5
+    k = 30
+    sentiment_df["satisfaction"] = (
+        (sentiment_df["positive_count"] + k * global_rate)
+        / (sentiment_df["positive_count"] + sentiment_df["negative_count"] + k)
+        * 10
+    ).round(1)
 
-    chart_df = (
+    all_rows = (
         sentiment_df
-        .set_index("neighborhood")[["sentiment_score"]]
-        .sort_values("sentiment_score", ascending=False)
-        .head(20)
+        .sort_values("satisfaction", ascending=False)
+        .reset_index(drop=True)
     )
-    st.bar_chart(chart_df, height=280)
 
-    with st.expander("Full sentiment breakdown", expanded=False):
-        display = sentiment_df[
-            ["neighborhood", "sentiment_score", "positive_count",
-             "negative_count", "restaurant_count"]
-        ].copy()
-        display["sentiment_score"] = display["sentiment_score"].map("{:.1%}".format)
-        st.dataframe(
-            display.rename(columns={
-                "neighborhood": "Neighborhood",
-                "sentiment_score": "Positive Rate",
-                "positive_count": "Positive Reviews",
-                "negative_count": "Negative Reviews",
-                "restaurant_count": "Restaurants",
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
+    st.caption(f"Diner satisfaction score (0–10) based on review sentiment — {city}")
+
+    display = all_rows[["neighborhood", "satisfaction", "positive_count", "negative_count", "restaurant_count"]].copy()
+    display.index = range(1, len(display) + 1)
+
+    row_px = 35
+    header_px = 38
+    table_height = header_px + row_px * len(display)
+
+    st.dataframe(
+        display.rename(columns={
+            "neighborhood": "Neighborhood",
+            "satisfaction": "Satisfaction (/ 10)",
+            "positive_count": "Positive Reviews",
+            "negative_count": "Negative Reviews",
+            "restaurant_count": "Restaurants",
+        }),
+        use_container_width=True,
+        height=table_height,
+        column_config={
+            "Satisfaction (/ 10)": st.column_config.ProgressColumn(
+                "Satisfaction (/ 10)",
+                min_value=0,
+                max_value=10,
+                format="%.1f",
+            ),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -712,15 +796,27 @@ def render_sentiment_panel(city: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    selected_city, cuisine_filter, user_id, pin_count = render_sidebar()
+    selected_city, cuisine_filter, pin_count = render_sidebar()
 
-    tab_map, tab_recs, tab_sentiment = st.tabs(["🗺️ Map", "⭐ Top Picks For You", "😊 Neighborhood Sentiment"])
+    # Resolve effective_user_id from widget session state BEFORE rendering any
+    # tab so the map pins and the recs panel always use the same value in one pass.
+    rec_mode = st.session_state.get("rec_mode", "cuisine")
+    effective_user_id: str | None = None
+    if rec_mode == "cuisine":
+        selected_cuisines = st.session_state.get("rec_cuisines", [])
+        if selected_cuisines:
+            effective_user_id = find_proxy_user(selected_city, tuple(selected_cuisines))
+    else:
+        raw = st.session_state.get("rec_user_id_text", "") or ""
+        effective_user_id = raw.strip() or None
+
+    tab_map, tab_recs, tab_sentiment = st.tabs(["Map", "Top Picks For You", "Neighborhood Sentiment"])
 
     with tab_map:
-        render_map_panel(selected_city, cuisine_filter, user_id, pin_count)
+        render_map_panel(selected_city, cuisine_filter, effective_user_id, pin_count)
 
     with tab_recs:
-        render_recommendations_panel(user_id, selected_city)
+        render_recommendations_panel(selected_city, effective_user_id)
 
     with tab_sentiment:
         render_sentiment_panel(selected_city)

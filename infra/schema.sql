@@ -43,3 +43,4 @@ CREATE INDEX IF NOT EXISTS idx_business_city   ON business_scores(city);
 CREATE INDEX IF NOT EXISTS idx_business_metro  ON business_scores(metro_area);
 CREATE INDEX IF NOT EXISTS idx_grid_metro      ON grid_aggregates(metro_area);
 CREATE INDEX IF NOT EXISTS idx_als_user        ON als_recommendations(user_id);
+CREATE INDEX IF NOT EXISTS idx_als_business  ON als_recommendations(business_id);

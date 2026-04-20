@@ -67,7 +67,7 @@ def load_reviews_for_classifier(input_path: str) -> pd.DataFrame:
 # Scikit-learn sentiment classifier (local mode)
 # ---------------------------------------------------------------------------
 
-def train_and_evaluate_classifier(reviews: pd.DataFrame) -> tuple[float, float]:
+def train_and_evaluate_classifier(reviews: pd.DataFrame):
     """
     Train a TF-IDF + LogisticRegression classifier on review text.
 

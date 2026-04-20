@@ -84,7 +84,7 @@ def load_reviews(spark: SparkSession, input_path: str) -> DataFrame:
 # User-item matrix construction
 # ---------------------------------------------------------------------------
 
-def build_user_item_matrix(df: DataFrame) -> tuple[DataFrame, dict, dict]:
+def build_user_item_matrix(df: DataFrame):
     """
     Encode string user/business IDs as integer indices required by ALS.
 
@@ -279,8 +279,11 @@ def write_recommendations(recs_pd, db_url: str) -> None:
     Uses pandas.DataFrame.to_sql with if_exists='replace' to overwrite
     stale recommendations on every run, matching the pipeline's nightly
     refresh cadence.
+
+    Indices are recreated after the replace because to_sql drops and
+    recreates the table, losing any previously created indices.
     """
-    from sqlalchemy import create_engine
+    from sqlalchemy import create_engine, text
 
     # pool_pre_ping re-tests the connection before use — guards against the
     # PostgreSQL idle-timeout kicking in while Spark compute is running.
@@ -294,6 +297,17 @@ def write_recommendations(recs_pd, db_url: str) -> None:
         chunksize=10000,
     )
     print(f"  Wrote {len(recs_pd):,} recommendation rows to {db_url}")
+
+    # Recreate indices dropped by the table replace.
+    # engine.begin() opens a transaction that auto-commits on success.
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_als_user     ON als_recommendations(user_id)"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_als_business ON als_recommendations(business_id)"
+        ))
+    print("  Recreated indices on als_recommendations")
 
 
 # ---------------------------------------------------------------------------
