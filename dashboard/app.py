@@ -38,6 +38,27 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+st.markdown("""
+<style>
+    .block-container { padding-top: 0.5rem; padding-bottom: 0; }
+    header[data-testid="stHeader"] { display: none; }
+    div[data-testid="stSidebar"] > div { padding-top: 0.5rem; padding-bottom: 0; }
+    div[data-testid="stSidebar"] section { padding-top: 0 !important; }
+    div[data-testid="stSidebarContent"] { gap: 0; }
+    div[data-testid="stSidebar"] hr { margin: 0.4rem 0; }
+    div[data-testid="stSidebar"] h1 { margin-bottom: 0; padding-bottom: 0; }
+    div[data-testid="stSidebar"] .stSelectbox { margin-bottom: 0; }
+    div[data-testid="stSidebar"] .stTextInput { margin-bottom: 0; }
+    div[data-testid="stSidebar"] .stSlider { margin-bottom: 0; }
+    div[data-testid="stSidebar"] p { margin-bottom: 0.2rem; }
+    div[data-testid="stSidebar"] table { margin-top: 0.2rem; }
+    div[data-testid="stVerticalBlock"] > div { gap: 0.25rem; }
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] { padding-left: 24px; padding-right: 24px; }
+    .stTabs [data-baseweb="tab-panel"] { padding-top: 0.5rem; }
+</style>
+""", unsafe_allow_html=True)
+
 # ---------------------------------------------------------------------------
 # Database connection
 # ---------------------------------------------------------------------------
@@ -153,12 +174,14 @@ def load_recommendations(user_id: str, city: str) -> tuple[pd.DataFrame, bool]:
 def load_sentiment(city: str) -> pd.DataFrame:
     engine = get_engine()
     query = text("""
-        SELECT s.grid_cell, s.sentiment_score, s.positive_count, s.negative_count,
-               g.center_lat, g.center_lng, g.restaurant_count
-        FROM   grid_sentiment  s
-        JOIN   grid_aggregates g ON s.grid_cell = g.grid_cell
+        SELECT g.grid_cell, g.center_lat, g.center_lng, g.restaurant_count,
+               COALESCE(s.sentiment_score, 0) AS sentiment_score,
+               COALESCE(s.positive_count, 0)  AS positive_count,
+               COALESCE(s.negative_count, 0)  AS negative_count
+        FROM   grid_aggregates g
+        LEFT JOIN grid_sentiment s ON s.grid_cell = g.grid_cell
         WHERE  g.metro_area = :city
-        ORDER  BY s.sentiment_score DESC
+        ORDER  BY sentiment_score DESC
     """)
     try:
         with engine.connect() as conn:
@@ -349,7 +372,7 @@ def build_map(
 
     if businesses_df is not None and not businesses_df.empty:
         cluster = MarkerCluster(name="Restaurants").add_to(m)
-        for _, biz in businesses_df.head(30).iterrows():
+        for _, biz in businesses_df.iterrows():
             try:
                 lat_b = float(biz["latitude"])
                 lng_b = float(biz["longitude"])
@@ -475,11 +498,10 @@ def build_map(
 # UI — sidebar
 # ---------------------------------------------------------------------------
 
-def render_sidebar() -> tuple[str, str, str]:
-    """Render sidebar and return (selected_city, cuisine_filter, user_id)."""
-    st.sidebar.title("🍽️ CityBite")
+def render_sidebar() -> tuple[str, str, str, int]:
+    """Render sidebar and return (selected_city, cuisine_filter, user_id, pin_count)."""
+    st.sidebar.markdown("## 🍽️ CityBite")
     st.sidebar.caption("Restaurant popularity intelligence")
-    st.sidebar.divider()
 
     cities = load_cities()
     if not cities:
@@ -487,32 +509,38 @@ def render_sidebar() -> tuple[str, str, str]:
         st.stop()
 
     selected_city = st.sidebar.selectbox("City", cities, index=0)
-
     all_cuisines = _load_cuisines_for_city(selected_city)
     cuisine_filter = st.sidebar.selectbox("Cuisine", ["All"] + all_cuisines, index=0)
 
-    st.sidebar.divider()
     user_id = st.sidebar.text_input(
         "Yelp User ID",
         placeholder="Paste user_id for personalized picks ...",
         help="Enter a Yelp user_id to see your top-10 restaurant recommendations pinned on the map.",
     )
 
-    st.sidebar.divider()
-    st.sidebar.markdown(
-        "**Map key**\n\n"
-        "🟥 High popularity &nbsp; 🟧 Moderate &nbsp; 🟩 Low\n\n"
-        "🔵 Numbered pins = your recommendations"
+    pin_count = st.sidebar.slider(
+        "Pins on map",
+        min_value=10,
+        max_value=500,
+        value=50,
+        step=10,
+        help="Number of top-rated restaurants to pin on the map.",
     )
 
-    return selected_city, cuisine_filter, user_id
+    st.sidebar.markdown(
+        "**Map key**  \n"
+        "🟥 High &nbsp; 🟧 Moderate &nbsp; 🟩 Low  \n"
+        "🔵 Your recommendations"
+    )
+
+    return selected_city, cuisine_filter, user_id, pin_count
 
 
 # ---------------------------------------------------------------------------
 # UI — main panels
 # ---------------------------------------------------------------------------
 
-def render_map_panel(city: str, cuisine_filter: str, user_id: str) -> None:
+def render_map_panel(city: str, cuisine_filter: str, user_id: str, pin_count: int = 50) -> None:
     """Render the popularity heatmap with optional recommendation pins."""
 
     grid_df = load_grid_data(city)
@@ -528,17 +556,12 @@ def render_map_panel(city: str, cuisine_filter: str, user_id: str) -> None:
             recs_df = None
 
     biz_df = load_businesses(city, cuisine_filter)
-    m = build_map(grid_df, biz_df, recs_df)
-
-    # Render as a self-contained HTML iframe.  st_folium intercepts tile-layer
-    # requests and only activates them after a user clicks the layer control,
-    # leaving the basemap blank on first load.  components.html embeds the full
-    # Folium map HTML directly — tiles load immediately without any interaction.
-    components.html(m._repr_html_(), height=520, scrolling=False)
+    pinned_df = biz_df.head(pin_count)
 
     c1, c2, c3 = st.columns(3)
+    total = int(grid_df['restaurant_count'].sum())
     c1.metric("Neighborhoods", len(grid_df))
-    c2.metric("Total restaurants", f"{int(grid_df['restaurant_count'].sum()):,}")
+    c2.metric("Restaurants in DB", f"{total:,}", help=f"Top {len(pinned_df)} highest-rated pinned on map")
     c3.metric("Avg popularity score", f"{grid_df['avg_popularity'].mean():.2f}")
 
     label = f"Top restaurants — {city}"
@@ -546,14 +569,13 @@ def render_map_panel(city: str, cuisine_filter: str, user_id: str) -> None:
         label += f" · {cuisine_filter}"
 
     with st.expander(label, expanded=False):
-        biz_df = load_businesses(city, cuisine_filter)
         if biz_df.empty:
             st.info("No businesses match the current filter.")
         else:
             st.dataframe(
                 biz_df[
                     ["name", "categories", "avg_rating", "review_count", "popularity_score"]
-                ].head(50).rename(columns={
+                ].rename(columns={
                     "name": "Name",
                     "categories": "Cuisine",
                     "avg_rating": "Avg Rating",
@@ -562,13 +584,34 @@ def render_map_panel(city: str, cuisine_filter: str, user_id: str) -> None:
                 }),
                 use_container_width=True,
                 hide_index=True,
+                height=300,
             )
+
+    m = build_map(grid_df, pinned_df, recs_df)
+
+    # Render as a self-contained HTML iframe.  st_folium intercepts tile-layer
+    # requests and only activates them after a user clicks the layer control,
+    # leaving the basemap blank on first load.  components.html embeds the full
+    # Folium map HTML directly — tiles load immediately without any interaction.
+    map_html = m._repr_html_() + """
+<script>
+(function() {
+    var resize = function() {
+        var h = (window.parent || window).innerHeight;
+        var target = Math.max(300, h - 220);
+        var el = window.frameElement;
+        if (el) { el.style.height = target + 'px'; el.height = target; }
+        document.body.style.height = target + 'px';
+    };
+    resize();
+    window.addEventListener('resize', resize);
+})();
+</script>"""
+    components.html(map_html, height=600, scrolling=False)
 
 
 def render_recommendations_panel(user_id: str, city: str) -> None:
     """Render the personalized ALS recommendations list."""
-    st.subheader("Top Picks For You")
-
     if not user_id:
         st.info(
             "Enter your Yelp User ID in the sidebar to see personalized "
@@ -627,7 +670,6 @@ def render_sentiment_panel(city: str) -> None:
 
     sentiment_df = add_neighborhood_labels(sentiment_df)
 
-    st.subheader(f"Neighborhood Sentiment — {city}")
     st.caption(
         "Share of positive reviews (4–5 stars) per neighborhood. "
         "Higher = more satisfied diners."
@@ -665,21 +707,18 @@ def render_sentiment_panel(city: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    selected_city, cuisine_filter, user_id = render_sidebar()
+    selected_city, cuisine_filter, user_id, pin_count = render_sidebar()
 
-    st.title(f"🍽️ {selected_city}")
-    st.divider()
+    tab_map, tab_recs, tab_sentiment = st.tabs(["🗺️ Map", "⭐ Top Picks For You", "😊 Neighborhood Sentiment"])
 
-    left_col, right_col = st.columns([3, 2])
+    with tab_map:
+        render_map_panel(selected_city, cuisine_filter, user_id, pin_count)
 
-    with left_col:
-        render_map_panel(selected_city, cuisine_filter, user_id)
-
-    with right_col:
+    with tab_recs:
         render_recommendations_panel(user_id, selected_city)
 
-    st.divider()
-    render_sentiment_panel(selected_city)
+    with tab_sentiment:
+        render_sentiment_panel(selected_city)
 
 
 if __name__ == "__main__":
