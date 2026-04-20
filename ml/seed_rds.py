@@ -41,7 +41,7 @@ def compute_business_scores(spark: SparkSession, input_path: str) -> DataFrame:
 
     return (
         df.groupBy(
-            "business_id", "name", "city",
+            "business_id", "name", "metro_area", "city",
             "latitude", "longitude", "grid_cell", "categories",
         )
         .agg(
@@ -61,7 +61,7 @@ def compute_business_scores(spark: SparkSession, input_path: str) -> DataFrame:
 def compute_grid_aggregates(business_scores: DataFrame) -> DataFrame:
     return (
         business_scores
-        .groupBy("grid_cell", "city")
+        .groupBy("grid_cell", "metro_area")
         .agg(
             F.avg("latitude").alias("center_lat"),
             F.avg("longitude").alias("center_lng"),

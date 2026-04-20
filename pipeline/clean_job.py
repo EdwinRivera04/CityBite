@@ -3,11 +3,13 @@ PySpark cleaning job: raw Yelp JSON → enriched reviews Parquet.
 
 Steps:
   1. Read business.json + review.json
-  2. Drop nulls on key columns; filter is_open == 1
-  3. Join reviews ← businesses on business_id
-  4. Add recency_weight = 1 / (1 + days_since_review / 365)
-  5. Add grid_cell = "<lat_bucket>_<lng_bucket>" (0.1-degree grid)
-  6. Write Parquet partitioned by city
+  2. Drop nulls on key columns; filter is_open == 1; keep only restaurants
+  3. Normalize city name (title-case) and state (upper-case)
+  4. Assign metro_area via haversine-based greedy clustering (50 km radius)
+  5. Join reviews ← businesses on business_id
+  6. Add recency_weight = 1 / (1 + days_since_review / 365)
+  7. Add grid_cell = "<lat_bucket>_<lng_bucket>" (0.1-degree grid)
+  8. Write Parquet partitioned by metro_area
 
 Usage (local):
     spark-submit pipeline/clean_job.py \
@@ -27,7 +29,7 @@ from pathlib import Path
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType
+from pyspark.sql.types import DoubleType, StringType
 
 try:
     from dotenv import load_dotenv
@@ -35,8 +37,13 @@ try:
 except ImportError:
     pass  # not available on EMR — paths come from CLI args
 
+METRO_RADIUS_KM = 50.0
+
 REQUIRED_REVIEW_COLS = ["review_id", "business_id", "user_id", "stars", "date", "text"]
-REQUIRED_BUSINESS_COLS = ["business_id", "is_open", "name", "city", "state", "latitude", "longitude", "categories"]
+REQUIRED_BUSINESS_COLS = [
+    "business_id", "is_open", "name", "city", "state",
+    "latitude", "longitude", "categories", "review_count",
+]
 
 
 def validate_windows_local_hadoop(mode: str) -> None:
@@ -80,6 +87,57 @@ def read_json(spark: SparkSession, path: str, filename: str):
     return spark.read.json(full_path)
 
 
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in km — pure Python, safe on EMR without external libs."""
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi    = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def build_metro_map(city_anchors_pd, radius_km: float = METRO_RADIUS_KM) -> dict:
+    """
+    Greedy single-linkage metro clustering.
+
+    Cities are sorted descending by total_reviews so the highest-volume city
+    in each geographic cluster becomes the anchor (and its name labels the metro).
+    Returns {city_key -> metro_name}, e.g.:
+        {"Nashville_TN": "Nashville", "Brentwood_TN": "Nashville",
+         "Portland_OR": "Portland", "Portland_ME": "Portland, ME"}
+    """
+    df = city_anchors_pd.sort_values("total_reviews", ascending=False).reset_index(drop=True)
+    metro_map: dict = {}
+    anchors: list = []
+    used_names: set = set()
+
+    for _, row in df.iterrows():
+        ck = row["city_key"]
+        assigned = False
+        for anchor in anchors:
+            if haversine_km(
+                row["center_lat"], row["center_lng"],
+                anchor["center_lat"], anchor["center_lng"],
+            ) <= radius_km:
+                metro_map[ck] = anchor["metro_name"]
+                assigned = True
+                break
+        if not assigned:
+            city = row["city"]
+            state = row["state"]
+            metro_name = city if city not in used_names else f"{city}, {state}"
+            used_names.add(metro_name)
+            metro_map[ck] = metro_name
+            anchors.append({
+                "center_lat": row["center_lat"],
+                "center_lng": row["center_lng"],
+                "metro_name": metro_name,
+            })
+
+    return metro_map
+
+
 def add_recency_weight(df, date_col: str = "date"):
     today = datetime.now()
     today_ts = F.lit(today.strftime("%Y-%m-%d"))
@@ -94,12 +152,41 @@ def add_grid_cell(df, lat_col: str = "latitude", lng_col: str = "longitude"):
     return df.withColumn("grid_cell", cell)
 
 
-def clean_businesses(df):
-    return (
+def clean_businesses(df, spark, radius_km: float = METRO_RADIUS_KM):
+    # Step 1: select required columns, drop bad rows, filter open restaurants only
+    cleaned = (
         df.select(*REQUIRED_BUSINESS_COLS)
           .dropna(subset=["business_id", "latitude", "longitude"])
           .filter(F.col("is_open") == 1)
+          .filter(F.col("categories").contains("Restaurants"))
     )
+    # Step 2: normalize capitalization so "las vegas" == "Las Vegas"
+    cleaned = (
+        cleaned
+        .withColumn("city",  F.initcap(F.trim(F.col("city"))))
+        .withColumn("state", F.upper(F.trim(F.col("state"))))
+    )
+    # Step 3: disambiguation key prevents Portland OR colliding with Portland ME
+    cleaned = cleaned.withColumn(
+        "city_key", F.concat(F.col("city"), F.lit("_"), F.col("state"))
+    )
+    # Step 4: compute per-city center coords + total review volume on driver
+    anchors_pd = (
+        cleaned
+        .groupBy("city_key", "city", "state")
+        .agg(
+            F.avg("latitude").alias("center_lat"),
+            F.avg("longitude").alias("center_lng"),
+            F.sum(F.col("review_count").cast("long")).alias("total_reviews"),
+        )
+        .toPandas()
+    )
+    # Step 5: greedy metro clustering (driver-side), broadcast result to workers
+    metro_map = build_metro_map(anchors_pd, radius_km=radius_km)
+    bc_metro = spark.sparkContext.broadcast(metro_map)
+    lookup_metro = F.udf(lambda ck: bc_metro.value.get(ck, ck), StringType())
+
+    return cleaned.withColumn("metro_area", lookup_metro(F.col("city_key"))).drop("city_key")
 
 
 def clean_reviews(df):
@@ -122,7 +209,7 @@ def write_output(df, output_path: str, mode: str) -> None:
         (
             df.write
               .mode("overwrite")
-              .partitionBy("city")
+              .partitionBy("metro_area")
               .parquet(dest)
         )
     except Exception as e:
@@ -156,8 +243,8 @@ def main() -> None:
 
     print("Reading business data ...")
     raw_businesses = read_json(spark, args.input, "yelp_academic_dataset_business.json")
-    businesses = clean_businesses(raw_businesses)
-    print(f"  Open businesses: {businesses.count():,}")
+    businesses = clean_businesses(raw_businesses, spark)
+    print(f"  Open restaurants: {businesses.count():,}")
 
     print("Reading review data ...")
     raw_reviews = read_json(spark, args.input, "yelp_academic_dataset_review.json")

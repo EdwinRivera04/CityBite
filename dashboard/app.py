@@ -70,9 +70,9 @@ def load_cities() -> list[str]:
         engine = get_engine()
         with engine.connect() as conn:
             df = pd.read_sql(
-                text("SELECT DISTINCT city FROM business_scores ORDER BY city"), conn
+                text("SELECT DISTINCT metro_area FROM business_scores ORDER BY metro_area"), conn
             )
-        return df["city"].tolist()
+        return df["metro_area"].tolist()
     except Exception as e:
         st.error(f"Could not load cities: {e}. Make sure the pipeline has run.")
         return []
@@ -84,7 +84,7 @@ def load_grid_data(city: str) -> pd.DataFrame:
         engine = get_engine()
         with engine.connect() as conn:
             df = pd.read_sql(
-                text("SELECT * FROM grid_aggregates WHERE city = :city"),
+                text("SELECT * FROM grid_aggregates WHERE metro_area = :city"),
                 conn, params={"city": city},
             )
         return df
@@ -99,13 +99,13 @@ def load_businesses(city: str, cuisine_filter: str | None) -> pd.DataFrame:
     if cuisine_filter and cuisine_filter != "All":
         query = text(
             "SELECT * FROM business_scores "
-            "WHERE city = :city AND LOWER(categories) LIKE LOWER(:cat) "
+            "WHERE metro_area = :city AND LOWER(categories) LIKE LOWER(:cat) "
             "ORDER BY popularity_score DESC"
         )
         params = {"city": city, "cat": f"%{cuisine_filter}%"}
     else:
         query = text(
-            "SELECT * FROM business_scores WHERE city = :city "
+            "SELECT * FROM business_scores WHERE metro_area = :city "
             "ORDER BY popularity_score DESC"
         )
         params = {"city": city}
@@ -135,7 +135,7 @@ def load_recommendations(user_id: str, city: str) -> tuple[pd.DataFrame, bool]:
         JOIN   business_scores b ON r.business_id = b.business_id
         WHERE  r.user_id = :uid
     """
-    city_query = text(base_select + " AND b.city = :city ORDER BY r.rank")
+    city_query = text(base_select + " AND b.metro_area = :city ORDER BY r.rank")
     all_query  = text(base_select + " ORDER BY r.rank LIMIT 10")
     try:
         with engine.connect() as conn:
@@ -157,7 +157,7 @@ def load_sentiment(city: str) -> pd.DataFrame:
                g.center_lat, g.center_lng, g.restaurant_count
         FROM   grid_sentiment  s
         JOIN   grid_aggregates g ON s.grid_cell = g.grid_cell
-        WHERE  g.city = :city
+        WHERE  g.metro_area = :city
         ORDER  BY s.sentiment_score DESC
     """)
     try:
@@ -174,7 +174,7 @@ def _load_cuisines_for_city(city: str) -> list[str]:
         engine = get_engine()
         with engine.connect() as conn:
             df = pd.read_sql(
-                text("SELECT categories FROM business_scores WHERE city = :city"),
+                text("SELECT categories FROM business_scores WHERE metro_area = :city"),
                 conn, params={"city": city},
             )
         return sorted({

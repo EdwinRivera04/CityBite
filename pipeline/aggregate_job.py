@@ -55,7 +55,7 @@ def compute_business_scores(spark: SparkSession, input_path: str) -> DataFrame:
 
     return (
         df.groupBy(
-            "business_id", "name", "city",
+            "business_id", "name", "metro_area", "city",
             "latitude", "longitude", "grid_cell", "categories",
         )
         .agg(
@@ -75,7 +75,7 @@ def compute_business_scores(spark: SparkSession, input_path: str) -> DataFrame:
 def compute_grid_aggregates(business_scores: DataFrame) -> DataFrame:
     return (
         business_scores
-        .groupBy("grid_cell", "city")
+        .groupBy("grid_cell", "metro_area")
         .agg(
             F.avg("latitude").alias("center_lat"),
             F.avg("longitude").alias("center_lng"),
@@ -136,8 +136,8 @@ def main() -> None:
 
     # S3 / local Parquet output
     out = args.output.rstrip("/")
-    write_parquet(biz_scores, f"{out}/business_scores", partition_col="city")
-    write_parquet(grid_agg,   f"{out}/grid_aggregates", partition_col="city")
+    write_parquet(biz_scores, f"{out}/business_scores", partition_col="metro_area")
+    write_parquet(grid_agg,   f"{out}/grid_aggregates", partition_col="metro_area")
 
     # RDS JDBC write
     if not args.skip_jdbc:

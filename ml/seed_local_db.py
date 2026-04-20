@@ -61,7 +61,7 @@ def compute_business_scores(spark: SparkSession, input_path: str) -> DataFrame:
 
     scores = (
         df.groupBy(
-            "business_id", "name", "city",
+            "business_id", "name", "metro_area", "city",
             "latitude", "longitude", "grid_cell", "categories",
         )
         .agg(
@@ -89,7 +89,7 @@ def compute_grid_aggregates(business_scores: DataFrame) -> DataFrame:
     """
     return (
         business_scores
-        .groupBy("grid_cell", "city")
+        .groupBy("grid_cell", "metro_area")
         .agg(
             F.avg("latitude").alias("center_lat"),
             F.avg("longitude").alias("center_lng"),
@@ -117,6 +117,7 @@ def _ensure_sqlite_schema(db_path: str) -> None:
         business_id      TEXT PRIMARY KEY,
         name             TEXT,
         city             TEXT,
+        metro_area       TEXT,
         latitude         REAL,
         longitude        REAL,
         grid_cell        TEXT,
@@ -129,7 +130,7 @@ def _ensure_sqlite_schema(db_path: str) -> None:
 
     CREATE TABLE IF NOT EXISTS grid_aggregates (
         grid_cell         TEXT PRIMARY KEY,
-        city              TEXT,
+        metro_area        TEXT,
         center_lat        REAL,
         center_lng        REAL,
         avg_popularity    REAL,
@@ -153,9 +154,10 @@ def _ensure_sqlite_schema(db_path: str) -> None:
         last_updated    TEXT DEFAULT (datetime('now'))
     );
 
-    CREATE INDEX IF NOT EXISTS idx_business_city ON business_scores(city);
-    CREATE INDEX IF NOT EXISTS idx_grid_city     ON grid_aggregates(city);
-    CREATE INDEX IF NOT EXISTS idx_als_user      ON als_recommendations(user_id);
+    CREATE INDEX IF NOT EXISTS idx_business_city   ON business_scores(city);
+    CREATE INDEX IF NOT EXISTS idx_business_metro  ON business_scores(metro_area);
+    CREATE INDEX IF NOT EXISTS idx_grid_metro      ON grid_aggregates(metro_area);
+    CREATE INDEX IF NOT EXISTS idx_als_user        ON als_recommendations(user_id);
     """
     conn = sqlite3.connect(db_path)
     conn.executescript(ddl)
