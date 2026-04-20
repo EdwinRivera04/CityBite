@@ -220,3 +220,5 @@ data/processed/
 .DS_Store
 .idea/
 */.DS_Store
+
+*.gz

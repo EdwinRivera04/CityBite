@@ -217,17 +217,61 @@ def ensure_local_table() -> None:
 def write_sentiment(sentiment_pd: pd.DataFrame, db_url: str, mode: str) -> None:
     if mode == "local":
         ensure_local_table()
+        engine = create_engine(db_url)
+        with engine.begin() as conn:
+            sentiment_pd.to_sql(
+                name="grid_sentiment",
+                con=conn,
+                if_exists="replace",
+                index=False,
+                method="multi",
+                chunksize=2000,
+            )
+        print(f"  Wrote {len(sentiment_pd):,} rows to grid_sentiment")
+        return
 
-    engine = create_engine(db_url, pool_pre_ping=True, pool_recycle=3600)
-    sentiment_pd.to_sql(
-        name="grid_sentiment",
-        con=engine,
-        if_exists="replace",
-        index=False,
-        method="multi",
-        chunksize=2000,
+    # PostgreSQL via direct psycopg2 — avoids EMR's old pandas/SQLAlchemy clash
+    import io
+    import psycopg2
+
+    conn = psycopg2.connect(
+        host=os.environ["RDS_HOST"],
+        port=int(os.environ.get("RDS_PORT", "5432")),
+        dbname=os.environ["RDS_DB"],
+        user=os.environ["RDS_USER"],
+        password=os.environ["RDS_PASSWORD"],
+        connect_timeout=30,
     )
-    print(f"  Wrote {len(sentiment_pd):,} rows to grid_sentiment")
+    cur = conn.cursor()
+    cur.execute("DROP TABLE IF EXISTS grid_sentiment")
+    cur.execute("""
+        CREATE TABLE grid_sentiment (
+            grid_cell       VARCHAR(20) PRIMARY KEY,
+            sentiment_score FLOAT,
+            positive_count  INT,
+            negative_count  INT,
+            last_updated    TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    # Ensure clean types and drop any rows with nulls before COPY.
+    # copy_from needs \N for nulls (not empty string) — na_rep handles this.
+    out = (
+        sentiment_pd[["grid_cell", "sentiment_score", "positive_count", "negative_count"]]
+        .dropna(subset=["grid_cell", "sentiment_score"])
+        .copy()
+    )
+    out["positive_count"] = out["positive_count"].astype(int)
+    out["negative_count"] = out["negative_count"].astype(int)
+
+    buf = io.StringIO()
+    out.to_csv(buf, sep="\t", index=False, header=False, na_rep="\\N")
+    buf.seek(0)
+    cur.copy_from(buf, "grid_sentiment", sep="\t", null="\\N",
+                  columns=["grid_cell", "sentiment_score", "positive_count", "negative_count"])
+    conn.commit()
+    cur.close()
+    conn.close()
+    print(f"  Wrote {len(sentiment_pd):,} rows to grid_sentiment via psycopg2 COPY")
 
 
 def main() -> None:

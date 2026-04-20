@@ -274,40 +274,75 @@ def get_db_url(mode: str) -> str:
 
 def write_recommendations(recs_pd, db_url: str) -> None:
     """
-    Upsert ALS recommendations into the als_recommendations table.
+    Write ALS recommendations into the als_recommendations table.
 
-    Uses pandas.DataFrame.to_sql with if_exists='replace' to overwrite
-    stale recommendations on every run, matching the pipeline's nightly
-    refresh cadence.
-
-    Indices are recreated after the replace because to_sql drops and
-    recreates the table, losing any previously created indices.
+    Uses psycopg2 COPY for PostgreSQL (EMR) to avoid pandas/SQLAlchemy version
+    conflicts on EMR Python 3.7.  Falls back to SQLAlchemy to_sql for SQLite
+    (local dev).
     """
-    from sqlalchemy import create_engine, text
+    if db_url.startswith("sqlite"):
+        from sqlalchemy import create_engine, text
+        engine = create_engine(db_url)
+        with engine.begin() as conn:
+            recs_pd.to_sql(
+                name="als_recommendations",
+                con=conn,
+                if_exists="replace",
+                index=False,
+                method="multi",
+                chunksize=10000,
+            )
+        print(f"  Wrote {len(recs_pd):,} recommendation rows to {db_url}")
+        return
 
-    # pool_pre_ping re-tests the connection before use — guards against the
-    # PostgreSQL idle-timeout kicking in while Spark compute is running.
-    engine = create_engine(db_url, pool_pre_ping=True, pool_recycle=3600)
-    recs_pd.to_sql(
-        name="als_recommendations",
-        con=engine,
-        if_exists="replace",   # full refresh; keeps schema simple
-        index=False,
-        method="multi",        # batch inserts for speed
-        chunksize=10000,
+    # PostgreSQL via direct psycopg2 — avoids EMR's old pandas/SQLAlchemy clash
+    import io
+    import psycopg2
+
+    conn = psycopg2.connect(
+        host=os.environ["RDS_HOST"],
+        port=int(os.environ.get("RDS_PORT", "5432")),
+        dbname=os.environ["RDS_DB"],
+        user=os.environ["RDS_USER"],
+        password=os.environ["RDS_PASSWORD"],
+        connect_timeout=30,
     )
-    print(f"  Wrote {len(recs_pd):,} recommendation rows to {db_url}")
+    cur = conn.cursor()
 
-    # Recreate indices dropped by the table replace.
-    # engine.begin() opens a transaction that auto-commits on success.
-    with engine.begin() as conn:
-        conn.execute(text(
-            "CREATE INDEX IF NOT EXISTS idx_als_user     ON als_recommendations(user_id)"
-        ))
-        conn.execute(text(
-            "CREATE INDEX IF NOT EXISTS idx_als_business ON als_recommendations(business_id)"
-        ))
-    print("  Recreated indices on als_recommendations")
+    # Full refresh: drop + recreate so schema stays consistent
+    cur.execute("DROP TABLE IF EXISTS als_recommendations")
+    cur.execute("""
+        CREATE TABLE als_recommendations (
+            user_id          VARCHAR(50),
+            business_id      VARCHAR(50),
+            predicted_rating FLOAT,
+            rank             INT,
+            PRIMARY KEY (user_id, business_id)
+        )
+    """)
+
+    # COPY is orders of magnitude faster than INSERT for 11M rows.
+    # Tab-separated avoids comma-in-data issues; user/business IDs are alphanumeric.
+    # na_rep/null="\\N" ensures PostgreSQL COPY can handle any NaN values.
+    out = recs_pd[["user_id", "business_id", "predicted_rating", "rank"]].dropna().copy()
+    out["rank"] = out["rank"].astype(int)
+    out["predicted_rating"] = out["predicted_rating"].astype(float)
+
+    buf = io.StringIO()
+    out.to_csv(buf, sep="\t", index=False, header=False, na_rep="\\N")
+    buf.seek(0)
+    cur.copy_from(buf, "als_recommendations",
+                  sep="\t", null="\\N",
+                  columns=["user_id", "business_id", "predicted_rating", "rank"])
+
+    cur.execute("CREATE INDEX idx_als_user     ON als_recommendations(user_id)")
+    cur.execute("CREATE INDEX idx_als_business ON als_recommendations(business_id)")
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    print(f"  Wrote {len(recs_pd):,} recommendation rows via psycopg2 COPY")
+    print("  Created indices on als_recommendations")
 
 
 # ---------------------------------------------------------------------------
