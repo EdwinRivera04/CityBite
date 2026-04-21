@@ -156,8 +156,8 @@ def load_recommendations(user_id: str, city: str) -> tuple[pd.DataFrame, bool]:
         JOIN   business_scores b ON r.business_id = b.business_id
         WHERE  r.user_id = :uid
     """
-    city_query = text(base_select + " AND b.metro_area = :city ORDER BY r.rank")
-    all_query  = text(base_select + " ORDER BY r.rank LIMIT 10")
+    city_query = text(base_select + " AND b.metro_area = :city ORDER BY r.rank LIMIT 20")
+    all_query  = text(base_select + " ORDER BY r.rank LIMIT 20")
     try:
         with engine.connect() as conn:
             df = pd.read_sql(city_query, conn, params={"uid": user_id, "city": city})
@@ -257,21 +257,20 @@ def load_profiles(city: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def nlp_search(query: str, profiles_df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
+@st.cache_resource(show_spinner=False)
+def _tfidf_for_city(city: str):
     """
-    Return the top_n businesses whose profile_text best matches the query
-    using TF-IDF cosine similarity.
-    """
-    if profiles_df.empty or not query.strip():
-        return pd.DataFrame()
+    Fit a TF-IDF vectorizer on the business profiles for a city and cache it
+    in memory (cache_resource = no serialization, lives for the server lifetime).
 
-    try:
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.metrics.pairwise import cosine_similarity
-        import numpy as np
-    except ImportError:
-        st.error("scikit-learn is required for NLP search. Run: pip install scikit-learn")
-        return pd.DataFrame()
+    Returns (vectorizer, tfidf_matrix, profiles_df) or (None, None, empty_df)
+    if no profile data exists for the city.
+    """
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    profiles_df = load_profiles(city)
+    if profiles_df.empty:
+        return None, None, profiles_df
 
     corpus = profiles_df["profile_text"].fillna("").tolist()
     vectorizer = TfidfVectorizer(
@@ -281,20 +280,42 @@ def nlp_search(query: str, profiles_df: pd.DataFrame, top_n: int = 10) -> pd.Dat
         sublinear_tf=True,
     )
     tfidf_matrix = vectorizer.fit_transform(corpus)
-    query_vec = vectorizer.transform([query])
-    tfidf_scores = cosine_similarity(query_vec, tfidf_matrix).flatten()
+    return vectorizer, tfidf_matrix, profiles_df
+
+
+def nlp_search(query: str, profiles_df: pd.DataFrame, top_n: int = 10,
+               _vectorizer=None, _tfidf_matrix=None) -> pd.DataFrame:
+    """
+    Return the top_n businesses whose profile_text best matches the query.
+
+    When _vectorizer and _tfidf_matrix are provided (pre-fitted via
+    _tfidf_for_city), they are used directly — no re-fitting on every call.
+    When omitted (e.g. in tests), the vectorizer is fitted on profiles_df.
+    """
+    import numpy as np
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    if profiles_df.empty or not query.strip():
+        return pd.DataFrame()
+
+    if _vectorizer is None or _tfidf_matrix is None:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        corpus = profiles_df["profile_text"].fillna("").tolist()
+        _vectorizer = TfidfVectorizer(
+            max_features=20_000, ngram_range=(1, 2), min_df=1, sublinear_tf=True,
+        )
+        _tfidf_matrix = _vectorizer.fit_transform(corpus)
+
+    query_vec = _vectorizer.transform([query])
+    tfidf_scores = cosine_similarity(query_vec, _tfidf_matrix).flatten()
 
     # Blend: 60% TF-IDF relevance + 25% log-popularity + 15% avg_rating
-    review_counts = profiles_df["review_count"].fillna(0).astype(float).values
-    log_pop = np.log1p(review_counts)
+    log_pop = np.log1p(profiles_df["review_count"].fillna(0).astype(float).values)
     pop_norm = log_pop / (log_pop.max() or 1.0)
-
-    ratings = profiles_df["avg_rating"].fillna(0).astype(float).values
-    rating_norm = ratings / 5.0
+    rating_norm = profiles_df["avg_rating"].fillna(0).astype(float).values / 5.0
 
     scores = tfidf_scores * 0.6 + pop_norm * 0.25 + rating_norm * 0.15
 
-    # Only return results where the query actually matched something
     top_idx = np.argsort(scores)[::-1][:top_n]
     result = profiles_df.iloc[top_idx].copy()
     result["match_score"] = tfidf_scores[top_idx]
@@ -471,6 +492,35 @@ def _score_color(norm: float) -> str:
     if norm >= _MED_SCORE:
         return "#ef6c00"   # amber — moderate
     return "#2e7d32"       # green — quiet
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_map_html(city: str, cuisine_filter: str, pin_count: int) -> str:
+    """
+    Build and cache the Folium map HTML string.
+
+    Caching the rendered HTML (not the Map object) ensures the string is
+    identical across reruns when inputs haven't changed, so components.html
+    does not recreate the iframe — keeping pins and tiles visible.
+    """
+    grid_df  = load_grid_data(city)
+    biz_df   = load_businesses(city, cuisine_filter)
+    pinned   = biz_df.head(pin_count)
+    m        = build_map(grid_df, pinned)
+    return m._repr_html_() + """
+<script>
+(function() {
+    var resize = function() {
+        var h = (window.parent || window).innerHeight;
+        var target = Math.max(300, h - 220);
+        var el = window.frameElement;
+        if (el) { el.style.height = target + 'px'; el.height = target; }
+        document.body.style.height = target + 'px';
+    };
+    resize();
+    window.addEventListener('resize', resize);
+})();
+</script>"""
 
 
 def build_map(
@@ -662,8 +712,8 @@ def build_map(
 # UI — sidebar
 # ---------------------------------------------------------------------------
 
-def render_sidebar() -> tuple[str, str, int]:
-    """Render sidebar and return (city, cuisine_filter, pin_count)."""
+def render_sidebar() -> str:
+    """Render sidebar and return selected city."""
     st.sidebar.markdown("## CityBite")
     st.sidebar.caption("Restaurant popularity intelligence")
 
@@ -672,34 +722,15 @@ def render_sidebar() -> tuple[str, str, int]:
         st.sidebar.error("No cities found. Run the pipeline first.")
         st.stop()
 
-    selected_city = st.sidebar.selectbox("City", cities, index=0)
-    all_cuisines = _load_cuisines_for_city(selected_city)
-    cuisine_filter = st.sidebar.selectbox("Cuisine", ["All"] + all_cuisines, index=0)
-
-    pin_count = st.sidebar.slider(
-        "Pins on map",
-        min_value=10,
-        max_value=500,
-        value=50,
-        step=10,
-        help="Number of top-rated restaurants to pin on the map.",
-    )
-
-    st.sidebar.markdown(
-        "**Map key**  \n"
-        "🔴 High &nbsp; 🟠 Moderate &nbsp; 🟢 Low  \n"
-        "📍 Your recommendations"
-    )
-
-    return selected_city, cuisine_filter, pin_count
+    return st.sidebar.selectbox("City", cities, index=0)
 
 
 # ---------------------------------------------------------------------------
 # UI — main panels
 # ---------------------------------------------------------------------------
 
-def render_map_panel(city: str, cuisine_filter: str, user_id: str, pin_count: int = 50) -> None:
-    """Render the popularity heatmap with optional recommendation pins."""
+def render_map_panel(city: str) -> None:
+    """Render the popularity heatmap with restaurant pins."""
 
     grid_df = load_grid_data(city)
 
@@ -707,20 +738,45 @@ def render_map_panel(city: str, cuisine_filter: str, user_id: str, pin_count: in
         st.warning(f"No grid data for {city}. Run the pipeline to populate the DB.")
         return
 
-    recs_df: pd.DataFrame | None = None
-    if user_id:
-        recs_df, _ = load_recommendations(user_id, city)
-        if recs_df is not None and recs_df.empty:
-            recs_df = None
+    all_cuisines = _load_cuisines_for_city(city)
+    col_filter, col_pins, col_key = st.columns([2, 2, 1])
+    with col_filter:
+        cuisine_filter = st.selectbox(
+            "Cuisine", ["All"] + all_cuisines, index=0, key="map_cuisine",
+        )
+    with col_pins:
+        pin_count = st.slider(
+            "Pins on map", min_value=10, max_value=500, value=50, step=10,
+            key="map_pin_count",
+        )
+    with col_key:
+        st.markdown(
+            "<div style='padding-top:28px;font-size:12px;line-height:1.9;white-space:nowrap'>"
+            "<span style='font-size:11px;font-weight:600;text-transform:uppercase;"
+            "letter-spacing:.05em;color:#aaa'>Key</span><br>"
+            "<span style='color:#c62828'>&#9632;</span> High &nbsp;"
+            "<span style='color:#ef6c00'>&#9632;</span> Med &nbsp;"
+            "<span style='color:#2e7d32'>&#9632;</span> Low"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    st.divider()
 
     biz_df = load_businesses(city, cuisine_filter)
-    pinned_df = biz_df.head(pin_count)
 
+    # Stats reflect the active filter
+    is_filtered = cuisine_filter != "All"
     c1, c2, c3 = st.columns(3)
-    total = int(grid_df['restaurant_count'].sum())
     c1.metric("Neighborhoods", len(grid_df))
-    c2.metric("Restaurants in DB", f"{total:,}", help=f"Top {len(pinned_df)} highest-rated pinned on map")
-    c3.metric("Avg popularity score", f"{grid_df['avg_popularity'].mean():.2f}")
+    c2.metric(
+        "Restaurants" + (f" ({cuisine_filter})" if is_filtered else ""),
+        f"{len(biz_df):,}",
+        help=f"Top {min(pin_count, len(biz_df))} pinned on map",
+    )
+    c3.metric(
+        "Avg popularity",
+        f"{biz_df['popularity_score'].mean():.2f}" if not biz_df.empty else "—",
+    )
 
     label = f"Top restaurants — {city}"
     if cuisine_filter != "All":
@@ -745,30 +801,12 @@ def render_map_panel(city: str, cuisine_filter: str, user_id: str, pin_count: in
                 height=300,
             )
 
-    m = build_map(grid_df, pinned_df, recs_df)
-
-    # Render as a self-contained HTML iframe.  st_folium intercepts tile-layer
-    # requests and only activates them after a user clicks the layer control,
-    # leaving the basemap blank on first load.  components.html embeds the full
-    # Folium map HTML directly — tiles load immediately without any interaction.
-    map_html = m._repr_html_() + """
-<script>
-(function() {
-    var resize = function() {
-        var h = (window.parent || window).innerHeight;
-        var target = Math.max(300, h - 220);
-        var el = window.frameElement;
-        if (el) { el.style.height = target + 'px'; el.height = target; }
-        document.body.style.height = target + 'px';
-    };
-    resize();
-    window.addEventListener('resize', resize);
-})();
-</script>"""
-    components.html(map_html, height=600, scrolling=False)
+    # build_map_html is cached — identical HTML string on every rerun unless
+    # city/cuisine/pins change, so components.html never recreates the iframe.
+    components.html(build_map_html(city, cuisine_filter, pin_count), height=600, scrolling=False)
 
 
-def render_recommendations_panel(city: str, effective_user_id: str | None) -> None:
+def render_recommendations_panel(city: str) -> None:
     """Render recommendation controls and the ALS recommendations list."""
 
     # ── Mode toggle ────────────────────────────────────────────────────────
@@ -796,12 +834,14 @@ def render_recommendations_panel(city: str, effective_user_id: str | None) -> No
         if not selected_cuisines:
             st.caption("Select up to 3 cuisines above to get taste-based recommendations.")
             return
+        with st.spinner("Finding your taste profile..."):
+            effective_user_id = find_proxy_user(city, tuple(selected_cuisines))
         if not effective_user_id:
             cuisine_str = ", ".join(selected_cuisines)
             st.warning(f"No taste profile found for {cuisine_str} in {city}. Run the ALS training job to generate recommendations.")
             return
         cuisine_str = " + ".join(selected_cuisines)
-        st.caption(f"Top picks for **{cuisine_str}** lovers in **{city}** — pinned on the map")
+        st.caption(f"Top picks for **{cuisine_str}** lovers in **{city}**")
 
     else:
         st.text_input(
@@ -810,12 +850,15 @@ def render_recommendations_panel(city: str, effective_user_id: str | None) -> No
             label_visibility="collapsed",
             key="rec_user_id_text",
         )
+        raw = st.session_state.get("rec_user_id_text", "") or ""
+        effective_user_id = raw.strip() or None
         if not effective_user_id:
             st.caption("Enter a Yelp User ID above to see personalized recommendations.")
             return
 
     # ── Recommendations list ───────────────────────────────────────────────
-    recs_df, city_filtered = load_recommendations(effective_user_id, city)
+    with st.spinner("Loading recommendations..."):
+        recs_df, city_filtered = load_recommendations(effective_user_id, city)
 
     if recs_df.empty:
         st.warning("No recommendations found. Run the ALS training job to generate them.")
@@ -823,9 +866,11 @@ def render_recommendations_panel(city: str, effective_user_id: str | None) -> No
 
     if rec_mode == "user_id":
         if city_filtered:
-            st.caption(f"Your top picks in **{city}** — pinned on the map")
+            st.caption(f"Your top picks in **{city}**")
         else:
             st.caption(f"No picks found in {city} — showing your top picks across all cities")
+
+    st.caption(f"Showing {len(recs_df)} recommendations — ALS model generates top 10 per user")
 
     for _, row in recs_df.iterrows():
         rating = float(row["avg_rating"])
@@ -866,13 +911,19 @@ def render_nlp_panel(city: str) -> None:
     if not query or not query.strip():
         return
 
-    profiles_df = load_profiles(city)
+    with st.spinner("Searching..."):
+        vectorizer, tfidf_matrix, profiles_df = _tfidf_for_city(city)
+
     if profiles_df.empty:
         st.warning(f"No restaurant data found for {city}. Make sure the pipeline has run.")
         return
 
-    with st.spinner("Searching..."):
-        results = nlp_search(query, profiles_df)
+    with st.spinner("Ranking results..."):
+        results = nlp_search(
+            query, profiles_df,
+            _vectorizer=vectorizer,
+            _tfidf_matrix=tfidf_matrix,
+        )
 
     if results.empty:
         st.info("No matches found. Try different keywords.")
@@ -968,29 +1019,17 @@ def render_sentiment_panel(city: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    selected_city, cuisine_filter, pin_count = render_sidebar()
-
-    # Resolve effective_user_id from widget session state BEFORE rendering any
-    # tab so the map pins and the recs panel always use the same value in one pass.
-    rec_mode = st.session_state.get("rec_mode", "cuisine")
-    effective_user_id: str | None = None
-    if rec_mode == "cuisine":
-        selected_cuisines = st.session_state.get("rec_cuisines", [])
-        if selected_cuisines:
-            effective_user_id = find_proxy_user(selected_city, tuple(selected_cuisines))
-    else:
-        raw = st.session_state.get("rec_user_id_text", "") or ""
-        effective_user_id = raw.strip() or None
+    selected_city = render_sidebar()
 
     tab_map, tab_recs, tab_nlp, tab_sentiment = st.tabs(
-        ["Map", "Top Picks For You", "Describe What You Want", "Neighborhood Sentiment"]
+        ["Map", "Top Picks For You", "Describe What You Want", "Citywide Neighborhood Sentiment"]
     )
 
     with tab_map:
-        render_map_panel(selected_city, cuisine_filter, effective_user_id, pin_count)
+        render_map_panel(selected_city)
 
     with tab_recs:
-        render_recommendations_panel(selected_city, effective_user_id)
+        render_recommendations_panel(selected_city)
 
     with tab_nlp:
         render_nlp_panel(selected_city)

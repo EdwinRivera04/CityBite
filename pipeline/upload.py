@@ -43,7 +43,8 @@ def _transfer_config() -> TransferConfig:
 
 def _s3_key(source_dir: Path, file_path: Path, prefix: str) -> str:
     relative = file_path.relative_to(source_dir)
-    return f"{prefix.rstrip('/')}/{relative}"
+    # Use forward slashes — S3 keys must not contain OS-specific separators
+    return f"{prefix.rstrip('/')}/{str(relative).replace(os.sep, '/')}"
 
 
 def verify_upload(s3: boto3.client, bucket: str, key: str, local_size: int) -> bool:

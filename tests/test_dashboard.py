@@ -39,7 +39,6 @@ sys.modules.setdefault("streamlit", _st_mock)
 sys.modules.setdefault("streamlit.components.v1", MagicMock())
 sys.modules.setdefault("folium", MagicMock())
 sys.modules.setdefault("folium.plugins", MagicMock())
-sys.modules.setdefault("sqlalchemy", MagicMock())
 
 # Now safe to import the pure helpers
 from dashboard.app import (  # noqa: E402
@@ -48,6 +47,7 @@ from dashboard.app import (  # noqa: E402
     _grid_cell_to_label,
     _score_color,
     add_neighborhood_labels,
+    nlp_search,
 )
 
 
@@ -161,17 +161,22 @@ class TestAddNeighborhoodLabels:
         assert result["neighborhood"].nunique() == len(result)
 
     def test_duplicate_labels_disambiguated_with_numbers(self):
-        # Two cells that map to the same compass label
+        # Two "North Outskirts" cells + one anchor cell far to the south.
+        # The anchor shifts city_lat south so both northern cells fall in the
+        # "North Outskirts" bucket — forcing the disambiguation suffix.
         df = self._grid_df([
-            ("34.0_-112.0", 34.05, -112.05),
-            ("34.1_-112.0", 34.15, -112.05),
+            ("33.3_-112.1", 33.35, -112.05),   # North Outskirts
+            ("33.3_-112.0", 33.35, -111.95),   # North Outskirts (same label)
+            ("30.4_-112.0", 30.45, -112.05),   # South anchor — shifts city center
         ])
         result = add_neighborhood_labels(df)
         labels = result["neighborhood"].tolist()
-        # Both must be distinct
-        assert labels[0] != labels[1]
-        # At least one should contain a number (disambiguation suffix)
-        assert any(any(c.isdigit() for c in lbl) for lbl in labels)
+        # All three must be distinct
+        assert len(set(labels)) == 3
+        # The two northern cells should have received numbered suffixes
+        north_labels = [lbl for lbl in labels[:2] if "North" in lbl]
+        assert len(north_labels) == 2
+        assert any(any(c.isdigit() for c in lbl) for lbl in north_labels)
 
     def test_empty_dataframe_returned_unchanged(self):
         result = add_neighborhood_labels(pd.DataFrame())
@@ -241,3 +246,107 @@ class TestBayesianSentimentAdjustment:
         score_k50 = self._adjust(pos, neg, global_rate, k=50)
         # Both above global_rate (positive-heavy), but k=50 should be closer to it
         assert abs(score_k50 - global_rate) < abs(score_k10 - global_rate)
+
+
+# ---------------------------------------------------------------------------
+# nlp_search
+# ---------------------------------------------------------------------------
+
+def _make_profiles(n: int = 10) -> pd.DataFrame:
+    """Minimal business profile DataFrame for nlp_search tests."""
+    return pd.DataFrame({
+        "business_id":    [f"b{i}" for i in range(n)],
+        "name":           [f"Business {i}" for i in range(n)],
+        "city":           ["Phoenix"] * n,
+        "latitude":       [33.4 + i * 0.01 for i in range(n)],
+        "longitude":      [-112.0 + i * 0.01 for i in range(n)],
+        "avg_rating":     [3.0 + (i % 3) * 0.5 for i in range(n)],
+        "review_count":   [50 + i * 10 for i in range(n)],
+        "popularity_score": [0.3 + i * 0.05 for i in range(n)],
+        "profile_text":   [
+            "pizza italian pasta wine",
+            "sushi japanese ramen noodles",
+            "tacos mexican burrito salsa",
+            "burger american fries",
+            "thai spicy curry noodles",
+            "indian curry tandoori",
+            "chinese dim sum noodles",
+            "french bistro wine crepes",
+            "coffee cafe espresso brunch",
+            "bbq smokehouse ribs brisket",
+        ][:n],
+    })
+
+
+class TestNlpSearch:
+    def test_returns_dataframe(self):
+        profiles = _make_profiles()
+        result = nlp_search("pizza italian", profiles)
+        assert isinstance(result, pd.DataFrame)
+
+    def test_empty_query_returns_empty(self):
+        profiles = _make_profiles()
+        result = nlp_search("", profiles)
+        assert result.empty
+
+    def test_whitespace_only_query_returns_empty(self):
+        profiles = _make_profiles()
+        result = nlp_search("   ", profiles)
+        assert result.empty
+
+    def test_empty_profiles_returns_empty(self):
+        result = nlp_search("pizza", pd.DataFrame())
+        assert result.empty
+
+    def test_result_has_match_score_column(self):
+        profiles = _make_profiles()
+        result = nlp_search("pizza", profiles)
+        assert "match_score" in result.columns
+
+    def test_result_has_final_score_column(self):
+        profiles = _make_profiles()
+        result = nlp_search("pizza", profiles)
+        assert "final_score" in result.columns
+
+    def test_top_n_respected(self):
+        profiles = _make_profiles(10)
+        result = nlp_search("food", profiles, top_n=3)
+        assert len(result) <= 3
+
+    def test_only_matching_rows_returned(self):
+        """match_score > 0 filter: all returned rows must have at least some match."""
+        profiles = _make_profiles()
+        result = nlp_search("pizza italian pasta", profiles)
+        assert (result["match_score"] > 0).all()
+
+    def test_relevant_result_ranks_first(self):
+        """A query closely matching one profile should return that profile first."""
+        profiles = _make_profiles()
+        # "pizza italian pasta wine" is profile 0
+        result = nlp_search("pizza italian pasta wine", profiles, top_n=5)
+        assert not result.empty
+        assert result.iloc[0]["business_id"] == "b0"
+
+    def test_accepts_prefit_vectorizer(self):
+        """Passing pre-fitted vectorizer/matrix produces same top result."""
+        from sklearn.feature_extraction.text import TfidfVectorizer
+
+        profiles = _make_profiles()
+        corpus = profiles["profile_text"].fillna("").tolist()
+        vec = TfidfVectorizer(max_features=5_000, ngram_range=(1, 2), min_df=1, sublinear_tf=True)
+        mat = vec.fit_transform(corpus)
+
+        result_cached = nlp_search("sushi japanese", profiles, _vectorizer=vec, _tfidf_matrix=mat)
+        result_fresh  = nlp_search("sushi japanese", profiles)
+        # Both should find business b1 (sushi japanese profile) in top results
+        assert not result_cached.empty
+        assert not result_fresh.empty
+        assert result_cached.iloc[0]["business_id"] == result_fresh.iloc[0]["business_id"]
+
+    def test_scores_in_valid_range(self):
+        profiles = _make_profiles()
+        result = nlp_search("tacos", profiles)
+        if not result.empty:
+            assert (result["match_score"] >= 0).all()
+            assert (result["final_score"] >= 0).all()
+            assert (result["final_score"] <= 1.5).all()  # blended score can slightly exceed 1

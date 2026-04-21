@@ -88,12 +88,13 @@ class TestTransientCluster:
 
 
 class TestUploadScripts:
-    def test_skips_missing_local_file(self, aws_credentials, capsys):
+    def test_skips_missing_local_file(self, aws_credentials, capsys, tmp_path, monkeypatch):
+        # chdir to an empty temp dir so all relative script paths are missing
+        monkeypatch.chdir(tmp_path)
         with mock_s3():
             conn = boto3.client("s3", region_name=REGION)
             conn.create_bucket(Bucket=BUCKET)
             from pipeline.submit_emr import upload_scripts
-            # aggregate_job.py doesn't exist yet — should warn, not crash
             upload_scripts(["aggregate"])
             captured = capsys.readouterr()
             assert "WARNING" in captured.out
