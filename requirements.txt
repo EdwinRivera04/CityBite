@@ -9,6 +9,7 @@ psycopg2-binary==2.9.9
 sqlalchemy==2.0.23
 python-dotenv==1.0.0
 numpy==1.26.0
+geopy==2.4.1
 
 # Testing
 pytest==7.4.0

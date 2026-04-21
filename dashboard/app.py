@@ -19,6 +19,8 @@ import os
 from collections import Counter
 
 import folium
+import geopy.geocoders
+import geopy.extra.rate_limiter
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -400,6 +402,27 @@ def _load_cuisines_for_city(city: str) -> list[str]:
 # Neighborhood naming
 # ---------------------------------------------------------------------------
 
+@st.cache_resource
+def _get_geocoder():
+    geolocator = geopy.geocoders.Nominatim(user_agent="citybite-dashboard")
+    return geopy.extra.rate_limiter.RateLimiter(geolocator.reverse, min_delay_seconds=1.0)
+
+
+@st.cache_data(ttl=604800)
+def _reverse_geocode_cell(lat: float, lng: float) -> str:
+    try:
+        result = _get_geocoder()(f"{lat:.4f}, {lng:.4f}", language="en", addressdetails=True)
+        if result is None:
+            return ""
+        addr = result.raw.get("address", {})
+        for key in ("neighbourhood", "suburb", "quarter", "city_district", "town", "city"):
+            if addr.get(key):
+                return addr[key]
+    except Exception:
+        pass
+    return ""
+
+
 def _grid_cell_to_label(grid_cell: str, city_lat: float, city_lng: float) -> str:
     """
     Convert a grid_cell key like '35.2_-115.0' to a compass-direction
@@ -460,7 +483,15 @@ def add_neighborhood_labels(df: pd.DataFrame) -> pd.DataFrame:
     city_lat = df["center_lat"].mean()
     city_lng = df["center_lng"].mean()
 
-    raw = [_grid_cell_to_label(gc, city_lat, city_lng) for gc in df["grid_cell"]]
+    raw = []
+    for _, row in df.iterrows():
+        name = _reverse_geocode_cell(
+            round(float(row["center_lat"]), 4),
+            round(float(row["center_lng"]), 4),
+        )
+        if not name:
+            name = _grid_cell_to_label(row["grid_cell"], city_lat, city_lng)
+        raw.append(name)
 
     seen_count: Counter = Counter(raw)
     seen_index: Counter = Counter()
@@ -962,7 +993,8 @@ def render_sentiment_panel(city: str) -> None:
 
     # Use grid_df as the label source so neighborhood names match the map exactly
     grid_df = load_grid_data(city)
-    labeled_grid = add_neighborhood_labels(grid_df)[["grid_cell", "neighborhood"]]
+    with st.spinner("Loading neighborhood names..."):
+        labeled_grid = add_neighborhood_labels(grid_df)[["grid_cell", "neighborhood"]]
     sentiment_df = sentiment_df.merge(labeled_grid, on="grid_cell", how="left")
 
     # Bayesian-adjusted satisfaction: shrink low-volume neighborhoods toward the
