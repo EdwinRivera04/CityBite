@@ -1036,7 +1036,7 @@ def render_sentiment_panel(city: str) -> None:
         .reset_index(drop=True)
     )
 
-    st.caption(f"Diner satisfaction score (0–10) based on review sentiment — {city}")
+    st.caption(f"Diner satisfaction score (0–10) based on review sentiment — {city} Metro Area")
 
     display = all_rows[["neighborhood", "satisfaction", "positive_count", "negative_count", "restaurant_count"]].copy()
     display.index = range(1, len(display) + 1)
