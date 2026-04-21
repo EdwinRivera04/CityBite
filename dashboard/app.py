@@ -417,12 +417,23 @@ def _reverse_geocode_cell(lat: float, lng: float) -> str:
     if key in cache:
         return cache[key]
     try:
-        result = geocoder(f"{key[0]:.4f}, {key[1]:.4f}", language="en", addressdetails=True)
+        # zoom=14 targets the neighborhood/suburb level; higher zoom returns
+        # street-level data that misses named districts for many US cells.
+        result = geocoder(
+            f"{key[0]:.4f}, {key[1]:.4f}",
+            language="en",
+            addressdetails=True,
+            zoom=14,
+        )
         if result is not None:
             addr = result.raw.get("address", {})
-            # Omit "city" — it returns the metro name (e.g. "Nashville") for many
-            # cells inside city limits, causing unhelpful duplicates.
-            for osm_key in ("neighbourhood", "suburb", "quarter", "city_district", "town", "village"):
+            # Priority: most-specific named area first.
+            # Omit "city" — returns the metro name for cells inside city limits,
+            # causing unhelpful "Nashville 1", "Nashville 2" duplicates.
+            for osm_key in (
+                "neighbourhood", "suburb", "quarter", "city_district",
+                "hamlet", "locality", "town", "village", "municipality",
+            ):
                 if addr.get(osm_key):
                     cache[key] = addr[osm_key]
                     return cache[key]
