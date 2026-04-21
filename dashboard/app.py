@@ -403,23 +403,32 @@ def _load_cuisines_for_city(city: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 @st.cache_resource
-def _get_geocoder():
+def _get_geocoder_and_cache():
+    """Persist both the rate-limited geocoder and result dict across rerenders."""
     geolocator = geopy.geocoders.Nominatim(user_agent="citybite-dashboard")
-    return geopy.extra.rate_limiter.RateLimiter(geolocator.reverse, min_delay_seconds=1.0)
+    geocoder = geopy.extra.rate_limiter.RateLimiter(geolocator.reverse, min_delay_seconds=1.0)
+    return geocoder, {}
 
 
-@st.cache_data(ttl=604800)
 def _reverse_geocode_cell(lat: float, lng: float) -> str:
+    """Return a real neighborhood/suburb name, or '' to trigger compass fallback."""
+    key = (round(lat, 4), round(lng, 4))
+    geocoder, cache = _get_geocoder_and_cache()
+    if key in cache:
+        return cache[key]
     try:
-        result = _get_geocoder()(f"{lat:.4f}, {lng:.4f}", language="en", addressdetails=True)
-        if result is None:
-            return ""
-        addr = result.raw.get("address", {})
-        for key in ("neighbourhood", "suburb", "quarter", "city_district", "town", "city"):
-            if addr.get(key):
-                return addr[key]
+        result = geocoder(f"{key[0]:.4f}, {key[1]:.4f}", language="en", addressdetails=True)
+        if result is not None:
+            addr = result.raw.get("address", {})
+            # Omit "city" — it returns the metro name (e.g. "Nashville") for many
+            # cells inside city limits, causing unhelpful duplicates.
+            for osm_key in ("neighbourhood", "suburb", "quarter", "city_district", "town", "village"):
+                if addr.get(osm_key):
+                    cache[key] = addr[osm_key]
+                    return cache[key]
     except Exception:
         pass
+    cache[key] = ""
     return ""
 
 
