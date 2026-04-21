@@ -1067,10 +1067,48 @@ def render_sentiment_panel(city: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Geocache pre-warm
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def _start_geocache_prewarm():
+    """Background thread: geocode every grid cell on startup so the sentiment
+    tab loads instantly when the user picks a city."""
+    import threading
+
+    def _run():
+        try:
+            engine = get_engine()
+            with engine.connect() as conn:
+                cities = pd.read_sql(
+                    text("SELECT DISTINCT metro_area FROM business_scores ORDER BY metro_area"),
+                    conn,
+                )["metro_area"].tolist()
+            for city in cities:
+                with engine.connect() as conn:
+                    grid_df = pd.read_sql(
+                        text("SELECT center_lat, center_lng FROM grid_aggregates WHERE metro_area = :city"),
+                        conn,
+                        params={"city": city},
+                    )
+                for _, row in grid_df.iterrows():
+                    _reverse_geocode_cell(
+                        round(float(row["center_lat"]), 4),
+                        round(float(row["center_lng"]), 4),
+                    )
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    _start_geocache_prewarm()
     selected_city = render_sidebar()
 
     tab_map, tab_recs, tab_nlp, tab_sentiment = st.tabs(
