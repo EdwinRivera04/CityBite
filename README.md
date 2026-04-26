@@ -2,9 +2,51 @@
 
 Restaurant popularity intelligence platform built on AWS. Processes 7M+ Yelp reviews through a two-zone S3 data lake on Amazon EMR, trains a Spark MLlib ALS recommender and scikit-learn sentiment classifier, and serves results through a Streamlit + Folium dashboard.
 
+Note: Generative AI was used in this assignment to assist with writing, structuring, and refining the content. It was also used to analyze and write technical components, particularly within certain parts of our architecture and the use of Spark MLlib’s ALS model.
+
 ## Architecture
 
 ![CityBite Architecture](assets/big-data-project-arch.png)
+
+---
+
+## Data Flow: Input to Output
+
+```
+Yelp JSON (~9 GB)
+        │
+        ▼
+  pipeline/upload.py          ← multipart upload to S3 raw zone
+        │
+        ▼
+  pipeline/clean_job.py       ← PySpark: join + enrich + partition by metro_area
+        │   writes → s3://citybite/processed/reviews_enriched/
+        ▼
+  pipeline/aggregate_job.py   ← Spark SQL: popularity scores + grid aggregates
+        │   writes → s3://citybite/processed/business_scores/
+        │             s3://citybite/processed/grid_aggregates/
+        │             RDS: business_scores, grid_aggregates
+        ▼
+  ml/als_train.py             ← Spark MLlib ALS collaborative filter
+        │   writes → RDS: als_recommendations
+        ▼
+  ml/sentiment.py             ← sklearn TF-IDF + LogisticRegression
+        │   writes → RDS: grid_sentiment
+        ▼
+  ml/nlp_index.py             ← builds plain-English business profiles
+        │   writes → RDS: business_profiles
+        ▼
+  dashboard/app.py            ← Streamlit: reads RDS, serves live UI
+        │
+        ▼
+  Browser at localhost:8501
+    ├── Map tab          — HeatMap + restaurant pins (cuisine filter)
+    ├── Top Picks tab    — ALS recommendations by cuisine or Yelp User ID
+    ├── NLP Search tab   — describe what you want in plain English
+    └── Sentiment tab    — Bayesian diner satisfaction per neighborhood
+```
+
+Raw Yelp JSON files (~9 GB across business, review, and user datasets) are uploaded to an S3 raw zone via a Boto3 multipart upload script. From there, a PySpark cleaning job running on Amazon EMR reads the raw JSON, drops incomplete records, joins reviews with business metadata, computes a recency weight for each review, and writes enriched Parquet files back to S3 partitioned by metro area. A second Spark SQL aggregation job then reads those enriched reviews and computes a weighted popularity score per business — blending average rating, review volume, and recency — before rolling those scores up into 0.1° × 0.1° geographic grid cells and writing both tables to RDS PostgreSQL. With the core data in the database, three ML jobs run in sequence: an ALS collaborative filtering model generates personalized top-10 restaurant recommendations per user, a TF-IDF logistic regression classifier labels each review as positive or negative and computes neighborhood-level sentiment scores, and an NLP indexing job builds rich text profiles for every business by concatenating its category tags with a sample of review snippets. The Streamlit dashboard then reads all five RDS tables and presents the results across four tabs — an interactive heatmap, a personalized recommendations panel, a plain-English search interface, and a neighborhood sentiment leaderboard.
 
 ---
 
@@ -13,27 +55,37 @@ Restaurant popularity intelligence platform built on AWS. Processes 7M+ Yelp rev
 ```
 citybite/
 ├── pipeline/
-│   ├── upload.py          # Boto3 multipart upload -> S3 raw zone
-│   ├── clean_job.py       # PySpark: raw JSON -> enriched reviews (partitioned by city)
-│   ├── aggregate_job.py   # Spark SQL: popularity scores + grid aggregates -> RDS
+│   ├── upload.py          # Boto3 multipart upload → S3 raw zone
+│   ├── clean_job.py       # PySpark: raw JSON → enriched reviews (partitioned by metro_area)
+│   ├── aggregate_job.py   # Spark SQL: popularity scores + grid aggregates → RDS
 │   └── submit_emr.py      # Submit jobs to EMR (transient or persistent cluster)
 ├── ml/
-│   ├── als_train.py       # Spark MLlib ALS recommender (top-10 recs per user -> RDS)
-│   ├── sentiment.py       # scikit-learn TF-IDF + LogisticRegression -> RDS
-│   └── evaluate.py        # RMSE, precision@k evaluation helpers
+│   ├── als_train.py       # Spark MLlib ALS recommender (top-10 recs per user → RDS)
+│   ├── sentiment.py       # scikit-learn TF-IDF + LogisticRegression → RDS
+│   ├── nlp_index.py       # Builds NLP business profiles (categories + review snippets → RDS)
+│   ├── evaluate.py        # RMSE, precision@k evaluation helpers
+│   ├── seed_local_db.py   # Seeds local SQLite from processed Parquet (offline dev)
+│   ├── seed_rds.py        # Seeds RDS business_scores + grid_aggregates from local Parquet
+│   └── push_local_to_rds.py  # Copies als_recommendations, grid_sentiment, business_profiles → RDS
 ├── dashboard/
-│   └── app.py             # Streamlit app: Folium heatmap + rec panel + sentiment chart
+│   └── app.py             # Streamlit app: heatmap + recs + NLP search + sentiment
 ├── infra/
 │   ├── bootstrap.sh       # EMR bootstrap: pip-installs numpy/pandas/sqlalchemy/psycopg2
 │   ├── create_rds.py      # Provision RDS PostgreSQL (db.t3.micro)
-│   ├── schema.sql         # 4-table PostgreSQL schema
+│   ├── schema.sql         # 5-table PostgreSQL schema
 │   └── cron_setup.sh      # Nightly cron on EMR master node
 ├── data/
 │   └── sample/
 │       └── generate_sample.py  # Synthetic Yelp data for local dev
 ├── downloaded_data/            # Real Yelp JSON files (gitignored, ~9 GB)
 ├── tests/
-│   └── test_sentiment.py  # 20 unit tests for sentiment pipeline (no AWS needed)
+│   ├── test_als_train.py
+│   ├── test_clean_job.py
+│   ├── test_dashboard.py
+│   ├── test_evaluate.py
+│   ├── test_sentiment.py
+│   ├── test_submit_emr.py
+│   └── test_upload.py
 ├── notebooks/
 │   └── analysis.ipynb     # ALS + sentiment analysis notebook
 ├── requirements.txt
@@ -113,6 +165,8 @@ spark-submit pipeline/clean_job.py \
   --mode   local
 ```
 
+Outputs enriched Parquet to `data/processed/reviews_enriched/` partitioned by `metro_area`.
+
 ### 3. Run the aggregation pipeline locally
 
 ```bash
@@ -122,33 +176,98 @@ spark-submit pipeline/aggregate_job.py \
   --mode   local
 ```
 
-### 4. Run the ML models locally
+Writes `business_scores` and `grid_aggregates` Parquet to `data/gold/`.
+
+### 4. Seed the local SQLite database
 
 ```bash
-# ALS recommender (writes to data/citybite_local.db)
-spark-submit ml/als_train.py --input data/processed/ --mode local
-
-# Sentiment classifier (trains sklearn model, writes grid scores to local DB)
-spark-submit ml/sentiment.py --input data/processed/ --mode local
+python ml/seed_local_db.py --input data/processed/
 ```
 
-Expected results: ALS RMSE < 1.5, sentiment F1 > 0.80.
+Reads the processed Parquet and writes `business_scores` and `grid_aggregates` into `data/citybite_local.db`. Required before the dashboard will show a map.
 
-### 5. Launch the dashboard locally
+### 5. Run the ML models locally
+
+```bash
+# ALS recommender (writes als_recommendations → local SQLite)
+spark-submit ml/als_train.py --input data/processed/ --mode local
+
+# Sentiment classifier (writes grid_sentiment → local SQLite)
+spark-submit ml/sentiment.py --input data/processed/ --mode local
+
+# NLP profile index (writes business_profiles → local SQLite)
+spark-submit ml/nlp_index.py --input data/processed/ --mode local
+```
+
+Expected: ALS RMSE < 1.5, sentiment F1 > 0.80.
+
+### 6. Launch the dashboard locally
 
 ```bash
 streamlit run dashboard/app.py
 ```
 
-The dashboard auto-detects `RDS_HOST` in `.env`. If it is not set it falls back to `data/citybite_local.db` (SQLite), so it works entirely offline after step 3.
+The dashboard auto-detects `RDS_HOST` in `.env`. If it is not set it reads from `data/citybite_local.db` (SQLite), so it works entirely offline after steps 4–5.
 
 Open `http://localhost:8501` in your browser.
 
-### 6. Run unit tests
+### 7. Run unit tests
 
 ```bash
 pytest tests/ -v
 ```
+
+---
+
+## Pushing Local ML Results to RDS (hybrid workflow)
+
+If you ran the ML jobs locally but want the live RDS dashboard to reflect those results — without running a full EMR pipeline:
+
+```bash
+# Seed business_scores + grid_aggregates from local processed Parquet
+python ml/seed_rds.py --input data/processed/
+
+# Copy als_recommendations, grid_sentiment, business_profiles from local SQLite → RDS
+python ml/push_local_to_rds.py
+```
+
+`push_local_to_rds.py` requires `RDS_HOST`, `RDS_DB`, `RDS_USER`, and `RDS_PASSWORD` in your `.env`.
+
+---
+
+## Testing
+
+All tests run without AWS credentials or a live database. The PySpark tests use local mode, AWS tests use moto mocks, and dashboard tests patch out Streamlit at import time.
+
+### Run all tests
+
+```bash
+pytest tests/ -v
+```
+
+### Run a specific test file
+
+```bash
+pytest tests/test_clean_job.py -v       # PySpark pipeline transformations
+pytest tests/test_als_train.py -v       # ALS model training + evaluation
+pytest tests/test_sentiment.py -v       # sentiment classifier + grid scoring
+pytest tests/test_evaluate.py -v        # RMSE + precision@k helpers
+pytest tests/test_dashboard.py -v       # neighborhood labels + map color logic
+pytest tests/test_upload.py -v          # S3 upload (moto mock)
+pytest tests/test_submit_emr.py -v      # EMR job submission (moto mock)
+```
+
+### What each test file covers
+
+| File | Dependencies | What it tests |
+|---|---|---|
+| `test_clean_job.py` | PySpark local | join, recency weight, grid cell, metro area assignment |
+| `test_als_train.py` | PySpark local | user-item matrix, ALS training, RMSE evaluation, top-N recs |
+| `test_sentiment.py` | PySpark local + sklearn + SQLite | label assignment, TF-IDF classifier, grid sentiment aggregation |
+| `test_evaluate.py` | sklearn + SQLite | precision@k, sentiment F1 |
+| `test_dashboard.py` | pure Python | compass-direction labels, duplicate disambiguation, score colors |
+| `test_upload.py` | moto (S3 mock) | multipart upload, key construction, upload verification |
+| `test_submit_emr.py` | moto (EMR/S3 mock) | script upload, EMR step submission |
 
 ---
 
@@ -227,20 +346,20 @@ python pipeline/submit_emr.py clean aggregate
 
 Logs land at `s3://citybite-560580021963/logs/emr/<cluster-id>/`.
 
-### Step 6 — Train ML models on EMR
+### Step 6 — Train ML models and build NLP index on EMR
 
 ```bash
 # Transient cluster (recommended — cheapest, ~$2-4 per run)
-python pipeline/submit_emr.py als sentiment
+python pipeline/submit_emr.py als sentiment nlp
 
 # Persistent / manually-created cluster
 python pipeline/submit_emr.py setup   --cluster-id j-XXXXXXXXXXXX --wait
-python pipeline/submit_emr.py als sentiment --cluster-id j-XXXXXXXXXXXX
+python pipeline/submit_emr.py als sentiment nlp --cluster-id j-XXXXXXXXXXXX
 ```
 
 The `setup` step must run first on any cluster that was **not** launched by `submit_emr.py` (e.g. created via the AWS console), because those clusters lack the bootstrap action that installs `numpy`, `pandas`, `sqlalchemy`, and `psycopg2-binary`.
 
-Available jobs: `clean`, `aggregate`, `als`, `sentiment`, `setup`.
+Available jobs: `clean`, `aggregate`, `als`, `sentiment`, `nlp`, `setup`.
 
 ### Step 7 — Monitor progress
 
@@ -278,33 +397,44 @@ s3://citybite-560580021963/
 │   ├── review/yelp_academic_dataset_review.json
 │   └── user/yelp_academic_dataset_user.json
 ├── processed/
-│   ├── reviews_enriched/city=Phoenix/
-│   ├── business_scores/city=Phoenix/
-│   └── grid_aggregates/city=Phoenix/
-├── scripts/        <- pipeline + ML scripts, auto-uploaded by submit_emr.py
-└── logs/emr/       <- EMR step logs (only for transient clusters)
+│   ├── reviews_enriched/metro_area=Phoenix/
+│   ├── business_scores/metro_area=Phoenix/
+│   └── grid_aggregates/metro_area=Phoenix/
+├── scripts/        ← pipeline + ML scripts, auto-uploaded by submit_emr.py
+└── logs/emr/       ← EMR step logs (only for transient clusters)
 ```
 
 ---
 
 ## Database Schema
 
+Five tables are written by the pipeline and read by the dashboard:
+
 | Table | Key columns | Written by |
 |---|---|---|
-| `business_scores` | `business_id`, `popularity_score`, `grid_cell` | `aggregate_job.py` |
-| `grid_aggregates` | `grid_cell`, `avg_popularity`, `restaurant_count` | `aggregate_job.py` |
+| `business_scores` | `business_id`, `metro_area`, `popularity_score`, `grid_cell` | `aggregate_job.py` |
+| `grid_aggregates` | `grid_cell`, `metro_area`, `avg_popularity`, `restaurant_count` | `aggregate_job.py` |
 | `als_recommendations` | `user_id`, `business_id`, `predicted_rating`, `rank` | `als_train.py` |
 | `grid_sentiment` | `grid_cell`, `sentiment_score`, `positive_count` | `sentiment.py` |
+| `business_profiles` | `business_id`, `metro_area`, `profile_text` | `nlp_index.py` |
+
+Schema source of truth: `infra/schema.sql`.
 
 ---
 
 ## Dashboard Features
 
-- **Popularity heatmap** — 0.1° x 0.1° grid squares colored by weighted popularity score (CartoDB Positron basemap, loads automatically)
-- **Cuisine filter** — sidebar dropdown derived live from the selected city's business data
-- **Personalized recommendations** — enter a Yelp `user_id` to see top-10 ALS picks pinned on the map as numbered blue markers; city-filtered first, falls back to cross-city
-- **Neighborhood labels** — grid cells labeled by compass direction from city center (e.g. "North District", "Downtown", "Southeast Side") throughout the map, sentiment chart, and tables
-- **Sentiment chart** — bar chart of positive-review rate per neighborhood for the selected city
+The dashboard has four tabs:
+
+**Map** — CartoDB Positron basemap with a HeatMap gradient (blue → red) over 0.1° × 0.1° grid cells. Cuisine dropdown and pin-count slider let you surface the top N restaurants as clustered markers. Click any grid cell rectangle for neighborhood name, top cuisine, popularity score, and restaurant count.
+
+**Top Picks For You** — ALS collaborative filtering recommendations in two modes:
+- *Cuisine Taste* — select up to 3 cuisines; the app finds the ALS user whose recommendations best match and shows their top picks in the selected city.
+- *Yelp User ID* — paste a real Yelp user ID for personalized top-10 picks; falls back to cross-city results if the city has no recommendations for that user.
+
+**Describe What You Want** — plain-English NLP search backed by TF-IDF cosine similarity over `business_profiles`. Results are ranked by a blend of relevance (60%), log-popularity (25%), and average rating (15%). The TF-IDF index is pre-fitted per city and cached for the server lifetime. Falls back to categories-only search if `nlp_index.py` has not been run for that city.
+
+**Citywide Neighborhood Sentiment** — Bayesian-adjusted diner satisfaction score (0–10) per neighborhood. Neighborhood names come from Nominatim reverse geocoding (pre-warmed in a background thread on startup), falling back to compass-direction labels (e.g. "North District", "Southeast Outskirts") when geocoding returns no result.
 
 ---
 
@@ -346,6 +476,9 @@ python pipeline/submit_emr.py als --cluster-id j-XXXXXXXXXXXX
 # edit als job config to pass --cv, then resubmit
 ```
 
+**NLP search returns no results**
+Run `ml/nlp_index.py` (locally or via `python pipeline/submit_emr.py nlp`) to build the `business_profiles` table. The dashboard falls back to categories-only search until that table exists.
+
 **Folium map tiles blank in Streamlit**
 `st_folium` intercepts tile-layer requests and only activates them after user interaction. The dashboard uses `components.html(m._repr_html_(), ...)` instead, which embeds the map as a self-contained iframe — tiles load immediately with no clicks required.
 
@@ -357,3 +490,6 @@ export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
 # Windows (PowerShell)
 $env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-11.x.x-hotspot"
 ```
+
+**Dashboard shows no cities / empty map**
+Run `ml/seed_local_db.py` (local dev) or `ml/seed_rds.py` (RDS) after the aggregation pipeline finishes. The dashboard can't show anything until `business_scores` and `grid_aggregates` are populated.
