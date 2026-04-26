@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS business_scores (
     categories       TEXT,
     avg_rating       FLOAT,
     review_count     INT,
+    recency_score    FLOAT,
     popularity_score FLOAT,
     last_updated     TIMESTAMP DEFAULT NOW()
 );

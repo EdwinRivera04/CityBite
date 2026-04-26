@@ -114,3 +114,24 @@ class TestUploadScripts:
 
             from pipeline.submit_emr import upload_scripts
             upload_scripts(["clean"])  # should not raise
+
+
+class TestBuildStepEdgeCases:
+    def test_unknown_job_raises_key_error(self, aws_credentials):
+        from pipeline.submit_emr import _build_step
+        with pytest.raises(KeyError):
+            _build_step("bogus_job_that_does_not_exist")
+
+    def test_inject_env_includes_rds_host(self, aws_credentials, monkeypatch):
+        monkeypatch.setenv("RDS_HOST", "test-host.rds.amazonaws.com")
+        monkeypatch.setenv("RDS_PASSWORD", "secret")
+        from pipeline.submit_emr import _build_step
+        step = _build_step("als", inject_env=True)
+        bash_cmd = step["HadoopJarStep"]["Args"][-1]
+        assert "RDS_HOST" in bash_cmd
+        assert "test-host.rds.amazonaws.com" in bash_cmd
+
+    def test_setup_job_uses_bash(self, aws_credentials):
+        from pipeline.submit_emr import _build_step
+        step = _build_step("setup")
+        assert step["HadoopJarStep"]["Args"][0] == "bash"

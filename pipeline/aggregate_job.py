@@ -23,7 +23,7 @@ Usage (EMR):
 import argparse
 import os
 
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
 try:
@@ -73,7 +73,18 @@ def compute_business_scores(spark: SparkSession, input_path: str) -> DataFrame:
 
 
 def compute_grid_aggregates(business_scores: DataFrame) -> DataFrame:
-    return (
+    # Determine the most common category in each grid cell deterministically
+    # by ranking category counts and picking rank 1 (ties broken alphabetically).
+    cat_counts = business_scores.groupBy("grid_cell", "metro_area", "categories").count()
+    w = Window.partitionBy("grid_cell", "metro_area").orderBy(F.desc("count"), "categories")
+    top_cats = (
+        cat_counts
+        .withColumn("rn", F.row_number().over(w))
+        .filter(F.col("rn") == 1)
+        .select("grid_cell", "metro_area", F.col("categories").alias("top_cuisine"))
+    )
+
+    grid_agg = (
         business_scores
         .groupBy("grid_cell", "metro_area")
         .agg(
@@ -81,9 +92,10 @@ def compute_grid_aggregates(business_scores: DataFrame) -> DataFrame:
             F.avg("longitude").alias("center_lng"),
             F.avg("popularity_score").alias("avg_popularity"),
             F.count("*").alias("restaurant_count"),
-            F.first("categories").alias("top_cuisine"),
         )
+        .join(top_cats, on=["grid_cell", "metro_area"], how="left")
     )
+    return grid_agg
 
 
 def write_parquet(df: DataFrame, path: str, partition_col: str = None) -> None:
@@ -113,6 +125,18 @@ def write_jdbc(df: DataFrame, table: str) -> None:
     print(f"  Wrote JDBC → {table}")
 
 
+_RDS_ENV_KEYS = ("RDS_HOST", "RDS_PORT", "RDS_DB", "RDS_USER", "RDS_PASSWORD")
+
+
+def _require_rds_env() -> None:
+    missing = [k for k in _RDS_ENV_KEYS if not os.environ.get(k)]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required env vars for JDBC write: {missing}. "
+            "Set them in .env or pass --skip-jdbc for local testing."
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="CityBite PySpark aggregation job")
     parser.add_argument("--input",  required=True, help="Path to reviews_enriched Parquet")
@@ -121,6 +145,9 @@ def main() -> None:
     parser.add_argument("--skip-jdbc", action="store_true",
                         help="Skip JDBC write (useful for local testing without RDS)")
     args = parser.parse_args()
+
+    if not args.skip_jdbc:
+        _require_rds_env()
 
     spark = build_spark(args.mode)
 

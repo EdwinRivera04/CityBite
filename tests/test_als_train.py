@@ -15,6 +15,7 @@ from ml.als_train import (
     generate_recommendations,
     get_db_url,
     train_als,
+    write_recommendations,
 )
 
 
@@ -196,3 +197,60 @@ class TestGetDbUrl:
         url = get_db_url("emr")
         assert url.startswith("postgresql+psycopg2://")
         assert "my-host.rds.amazonaws.com" in url
+
+    def test_emr_mode_missing_rds_host_raises(self, monkeypatch):
+        monkeypatch.delenv("RDS_HOST", raising=False)
+        with pytest.raises(KeyError):
+            get_db_url("emr")
+
+
+# ---------------------------------------------------------------------------
+# write_recommendations
+# ---------------------------------------------------------------------------
+
+class TestWriteRecommendations:
+    def test_sqlite_roundtrip(self, sample_reviews, tmp_path):
+        """Write recs to a temp SQLite DB and read them back."""
+        import pandas as pd
+        from sqlalchemy import create_engine, text
+
+        matrix_df, user_map, biz_map = build_user_item_matrix(sample_reviews)
+        model = train_als(matrix_df, rank=5, max_iter=3)
+        recs = generate_recommendations(model, biz_map, user_map, top_n=2)
+
+        db_path = tmp_path / "test.db"
+        db_url = f"sqlite:///{db_path}"
+        write_recommendations(recs, db_url)
+
+        engine = create_engine(db_url)
+        with engine.connect() as conn:
+            result = pd.read_sql(text("SELECT * FROM als_recommendations"), conn)
+
+        assert len(result) == len(recs)
+        assert set(result.columns) >= {"user_id", "business_id", "predicted_rating", "rank"}
+
+    def test_no_nan_predicted_rating(self, sample_reviews, tmp_path):
+        """All written predicted_rating values must be finite (not NaN)."""
+        matrix_df, user_map, biz_map = build_user_item_matrix(sample_reviews)
+        model = train_als(matrix_df, rank=5, max_iter=3)
+        recs = generate_recommendations(model, biz_map, user_map, top_n=3)
+        assert not recs["predicted_rating"].isna().any()
+
+    def test_overwrite_on_rerun(self, sample_reviews, tmp_path):
+        """Calling write_recommendations twice should not duplicate rows."""
+        import pandas as pd
+        from sqlalchemy import create_engine, text
+
+        matrix_df, user_map, biz_map = build_user_item_matrix(sample_reviews)
+        model = train_als(matrix_df, rank=5, max_iter=3)
+        recs = generate_recommendations(model, biz_map, user_map, top_n=2)
+
+        db_url = f"sqlite:///{tmp_path / 'test.db'}"
+        write_recommendations(recs, db_url)
+        write_recommendations(recs, db_url)
+
+        engine = create_engine(db_url)
+        with engine.connect() as conn:
+            result = pd.read_sql(text("SELECT * FROM als_recommendations"), conn)
+
+        assert len(result) == len(recs)

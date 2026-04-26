@@ -6,15 +6,18 @@ No real AWS calls are made.
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from moto import mock_s3
 
 from pipeline.upload import (
     _s3_key,
     build_s3_client,
     upload_directory,
+    upload_file,
     verify_upload,
 )
 
@@ -106,3 +109,47 @@ class TestUploadDirectory:
         monkeypatch.setattr(upload_mod, "build_s3_client", lambda: None)
         success, failed = upload_directory(tmp_path, BUCKET, "raw/")
         assert success == 0 and failed == 0
+
+    def test_partial_failure_counted_separately(self, tmp_path, monkeypatch):
+        """One upload fails, one succeeds — failed == 1, success == 1."""
+        (tmp_path / "good.json").write_text('{"id": 1}')
+        (tmp_path / "bad.json").write_text('{"id": 2}')
+
+        with mock_s3():
+            conn = boto3.client("s3", region_name=REGION)
+            conn.create_bucket(Bucket=BUCKET)
+
+            import pipeline.upload as upload_mod
+            monkeypatch.setattr(upload_mod, "build_s3_client", lambda: conn)
+
+            original_upload_file = upload_mod.upload_file
+
+            def _fail_on_bad(s3, local_path, bucket, key):
+                if "bad" in local_path.name:
+                    return False
+                return original_upload_file(s3, local_path, bucket, key)
+
+            monkeypatch.setattr(upload_mod, "upload_file", _fail_on_bad)
+
+            success, failed = upload_directory(tmp_path, BUCKET, "raw/")
+
+        assert success == 1
+        assert failed == 1
+
+    def test_non_json_files_are_ignored(self, tmp_path, monkeypatch):
+        """CSV and TXT files alongside JSON files must not be uploaded."""
+        (tmp_path / "data.json").write_text('{"id": 1}')
+        (tmp_path / "notes.txt").write_text("ignore me")
+        (tmp_path / "table.csv").write_text("a,b\n1,2")
+
+        with mock_s3():
+            conn = boto3.client("s3", region_name=REGION)
+            conn.create_bucket(Bucket=BUCKET)
+
+            import pipeline.upload as upload_mod
+            monkeypatch.setattr(upload_mod, "build_s3_client", lambda: conn)
+
+            success, failed = upload_directory(tmp_path, BUCKET, "raw/")
+
+        assert success == 1
+        assert failed == 0

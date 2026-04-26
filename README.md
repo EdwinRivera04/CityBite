@@ -4,7 +4,146 @@ Restaurant popularity intelligence platform built on AWS. Processes 7M+ Yelp rev
 
 ## Architecture
 
-![CityBite Architecture](assets/big-data-project-arch.png)
+![CityBite Architecture](assets/CityBite-architecture.jpg)
+
+---
+
+## Data Flow — Input to Output
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  INPUT: Yelp Academic Dataset (~9 GB, 7M+ reviews, 150K businesses)     │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │  pipeline/upload.py  (boto3 multipart)
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  S3 RAW ZONE   s3://citybite/raw/                                       │
+│    business.json  ·  review.json  ·  user.json                          │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │  pipeline/clean_job.py  (PySpark on EMR)
+                                 │    • drop nulls / filter open businesses
+                                 │    • join reviews + businesses
+                                 │    • add recency_weight + grid_cell
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  S3 PROCESSED ZONE   s3://citybite/processed/                           │
+│    reviews_enriched/city=Phoenix/   (Parquet, partitioned by city)      │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │  pipeline/aggregate_job.py  (Spark SQL)
+                                 │    • popularity_score per business
+                                 │    • grid aggregates (0.1 x 0.1 deg cells)
+                                 ▼
+┌──────────────────────────────┐    ┌────────────────────────────────────┐
+│  S3 GOLD ZONE                │    │  RDS PostgreSQL                    │
+│  business_scores/ (Parquet)  │───>│    business_scores                 │
+│  grid_aggregates/ (Parquet)  │    │    grid_aggregates                 │
+└──────────────────────────────┘    └──────────────────┬─────────────────┘
+                                                       │
+                           ┌───────────────────────────┤
+                           │                           │
+              ml/als_train.py                  ml/sentiment.py
+              Spark MLlib ALS                  sklearn TF-IDF +
+              top-10 recs per user             LogisticRegression
+                           │                           │
+                           v                           v
+                  als_recommendations           grid_sentiment
+                       (RDS)                       (RDS)
+                           └───────────────────────────┘
+                                         │
+                                         ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  OUTPUT: Streamlit Dashboard  (dashboard/app.py)                        │
+│    • Folium heatmap — grid cells colored by popularity score            │
+│    • Personalized top-10 ALS restaurant recommendations                 │
+│    • Neighborhood sentiment bar chart                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## End-to-End Walkthrough
+
+Here's what happens to a review from the moment it's ingested to the moment it shows up on the map.
+
+### Stage 1 — Ingest
+Raw Yelp JSON files (business, review, user) go to the S3 **raw zone** via `pipeline/upload.py`. Files over 100 MB use multipart upload. Nothing is transformed here — just a straight copy.
+
+### Stage 2 — Clean & Enrich (`pipeline/clean_job.py`)
+A PySpark job on EMR reads the raw JSON, drops records missing `business_id`, `stars`, `text`, or `date`, and filters to open businesses (`is_open == 1`). Reviews are joined with businesses, then two derived columns are computed:
+
+- **`recency_weight`** — `1 / (1 + days_since_review / 365)` discounts older reviews
+- **`grid_cell`** — `floor(lat/0.1)*0.1_floor(lng/0.1)*0.1` snaps each business to an ~11 km² geographic cell
+
+Output is partitioned Parquet in the S3 **processed zone** (`city=Phoenix/`, etc.).
+
+### Stage 3 — Aggregate (`pipeline/aggregate_job.py`)
+Spark SQL computes two datasets from the enriched reviews:
+
+- **`business_scores`** — per-business `popularity_score = avg_rating * 0.4 + log(review_count+1) * 0.4 + recency_score * 0.2`
+- **`grid_aggregates`** — per-cell averages of popularity, restaurant count, and dominant cuisine
+
+Both are written to S3 (gold zone) and to RDS via JDBC for live dashboard queries.
+
+### Stage 4 — ML Training
+Two models train on the enriched reviews:
+
+| Model | Input | Output | Stored in |
+|---|---|---|---|
+| ALS (Spark MLlib) | user × business star ratings | top-10 restaurant recs per user | `als_recommendations` (RDS) |
+| Sentiment (sklearn) | review text + star label | % positive reviews per grid cell | `grid_sentiment` (RDS) |
+
+### Stage 5 — Dashboard
+The Streamlit app pulls everything from RDS on startup (cached 1 hour) and shows:
+
+1. **Folium heatmap** — each circle is a grid cell; radius and color encode popularity score
+2. **Recommendation panel** — paste any Yelp `user_id` to get ALS top-10 picks pinned on the map
+3. **Sentiment chart** — neighborhoods ranked by positive-review percentage
+
+---
+
+## Key Formulas
+
+These are the core calculations the system uses to score restaurants and neighborhoods.
+
+**Recency weight** — applied to every review in `pipeline/clean_job.py`
+```
+recency_weight = 1 / (1 + days_since_review / 365)
+```
+A review from a year ago gets weight 0.5; three years ago gets ~0.25. This keeps scores from being dominated by old hype.
+
+**Grid cell** — also in `clean_job.py`
+```
+grid_cell = f"{floor(lat/0.1)*0.1}_{floor(lng/0.1)*0.1}"
+```
+Rounds each restaurant's coordinates to the nearest 0.1° (~11 km²) box so neighborhoods can be compared at a consistent scale.
+
+**Popularity score** — computed in `pipeline/aggregate_job.py`
+```
+popularity_score = 0.4 * avg_rating
+                 + 0.4 * log(review_count + 1)
+                 + 0.2 * avg(recency_weight)
+```
+The log on review count prevents a Yelp veteran with 10 000 reviews from completely burying a newer place with better recent ratings. Weights split evenly between quality and volume, with a small freshness bump.
+
+**Sentiment score** — computed per neighborhood in `ml/sentiment.py`
+```
+sentiment_score = positive_count / (positive_count + negative_count)
+```
+3-star reviews are treated as neutral and excluded. Ranges 0–1.
+
+**Bayesian satisfaction score** — used in `dashboard/app.py` for the ranked sentiment chart
+```
+satisfaction = (positive + k * global_rate) / (positive + negative + k) × 10
+```
+`k = 30` pseudo-counts. A neighborhood with only 5 reviews gets pulled toward the city average instead of floating to #1 on a lucky streak. Scaled to 0–10.
+
+**NLP search score** — used when you type a query in the search bar (`ml/nlp_index.py`)
+```
+final_score = 0.6 * tfidf_cosine_similarity
+            + 0.25 * log1p(review_count) / max_log_count
+            + 0.15 * avg_rating / 5.0
+```
+Text relevance does most of the work; popularity and rating are tiebreakers.
 
 ---
 
@@ -149,6 +288,27 @@ Open `http://localhost:8501` in your browser.
 ```bash
 pytest tests/ -v
 ```
+
+139 tests across 6 files — no AWS or network required:
+
+| File | What it covers |
+|---|---|
+| `tests/test_clean_job.py` | PySpark ETL: business/review filtering, recency weight, grid cell, metro clustering |
+| `tests/test_als_train.py` | ALS matrix building, training, RMSE, recommendations, DB write |
+| `tests/test_sentiment.py` | TF-IDF classifier, Spark/pandas sentiment aggregation, DB write |
+| `tests/test_dashboard.py` | Score coloring, neighborhood labels, Bayesian sentiment, NLP search |
+| `tests/test_upload.py` | S3 key construction, multipart upload, verification (moto mock) |
+| `tests/test_submit_emr.py` | EMR step building, cluster launch, script upload (moto mock) |
+
+### 7. Run the analysis notebook
+
+```bash
+jupyter notebook notebooks/analysis.ipynb
+```
+
+Demonstrates the full pipeline end-to-end on local data: raw vs. processed distributions,
+ALS RMSE curve, sentiment before/after Bayesian adjustment, spatial grid heatmaps,
+and NLP search demo. All outputs saved to `assets/`.
 
 ---
 
@@ -357,3 +517,54 @@ export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
 # Windows (PowerShell)
 $env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-11.x.x-hotspot"
 ```
+
+---
+
+## Reproducibility
+
+To reproduce results from scratch on the local sample dataset:
+
+```bash
+# 1. Generate sample data (if not already present)
+python data/sample/generate_sample.py
+
+# 2. Run the pipeline
+spark-submit pipeline/clean_job.py --input data/sample/ --output data/processed/ --mode local
+spark-submit pipeline/aggregate_job.py --input data/processed/ --output data/gold/ --mode local --skip-jdbc
+spark-submit ml/als_train.py --input data/processed/ --mode local
+spark-submit ml/sentiment.py --input data/processed/ --mode local
+
+# 3. Open the dashboard
+streamlit run dashboard/app.py
+
+# 4. Run all unit tests
+pytest tests/ -v
+```
+
+Expected: ALS RMSE < 1.5, sentiment F1 > 0.80. All 139 unit tests pass.
+Sample data seed is fixed in `generate_sample.py` (`random.seed(42)`) for reproducible output.
+
+---
+
+## AI Assistance Disclosure
+
+Portions of this project used Claude Code (Anthropic) as a coding assistant under the
+[course AI policy](https://www.vanderbilt.edu). AI assistance was used for the following
+**permitted uses**:
+
+| Use | What the agent produced | How we validated it |
+|---|---|---|
+| Boilerplate code generation | boto3 multipart upload scaffolding, psycopg2 COPY pattern, Spark session setup | Manually reviewed and adapted; covered by unit tests |
+| Unit test scaffolding | moto S3/EMR mock fixtures, PySpark test fixtures, pytest parametrize patterns | All 139 tests reviewed and run (`pytest tests/ -v`) |
+| README and documentation drafting | Section structure, formula descriptions, troubleshooting entries | Reviewed and rewritten by authors for accuracy |
+| Bug identification | Identified `_score_color` color inversion, non-deterministic `top_cuisine`, `add_neighborhood_labels` geocoding edge case | Each fix verified by the corresponding unit test |
+
+**What the authors designed and are responsible for:**
+- All pipeline architecture decisions (two-zone S3, EMR transient cluster strategy, JDBC/SQLite dual path)
+- The recency weight, popularity score, and Bayesian sentiment formulas
+- ML model selection (ALS rank/regParam choices, TF-IDF feature engineering)
+- Dashboard layout, Folium map design, and NLP search blending weights
+- Correctness of all results and interpretation of outputs
+
+All generated code was unit-tested before submission. Potential failure scenarios were
+identified and documented as part of the pre-submission audit.

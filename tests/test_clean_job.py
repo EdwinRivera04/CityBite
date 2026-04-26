@@ -147,6 +147,13 @@ class TestAddRecencyWeight:
         weight = result.collect()[0].recency_weight
         assert 0.0 < weight <= 1.0
 
+    def test_today_review_weight_approximately_one(self, spark):
+        today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        df = spark.createDataFrame([{"review_id": "r1", "date": today}])
+        result = add_recency_weight(df)
+        weight = result.collect()[0].recency_weight
+        assert weight > 0.99
+
 
 class TestAddGridCell:
     def test_grid_cell_format(self, spark):
@@ -167,6 +174,20 @@ class TestAddGridCell:
         result = add_grid_cell(df)
         cells = [r.grid_cell for r in result.collect()]
         assert cells[0] == cells[1]
+
+    def test_grid_cell_uses_period_decimal_separator(self, spark):
+        """grid_cell must use '.' not ',' — guards against locale-sensitive JVM formatting."""
+        df = spark.createDataFrame([
+            {"latitude": 33.45, "longitude": -112.07},
+            {"latitude": 36.17, "longitude": -115.14},
+            {"latitude": -33.87, "longitude": 151.21},
+        ])
+        result = add_grid_cell(df)
+        for row in result.collect():
+            parts = row.grid_cell.split("_")
+            assert len(parts) == 2, f"Expected 2 parts, got: {row.grid_cell!r}"
+            float(parts[0])   # raises ValueError if comma decimal separator
+            float(parts[1])
 
 
 class TestBuildEnriched:

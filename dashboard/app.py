@@ -17,10 +17,10 @@ Run:
 import math
 import os
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import folium
 import geopy.geocoders
-import geopy.extra.rate_limiter
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -322,7 +322,7 @@ def nlp_search(query: str, profiles_df: pd.DataFrame, top_n: int = 10,
     result = profiles_df.iloc[top_idx].copy()
     result["match_score"] = tfidf_scores[top_idx]
     result["final_score"] = scores[top_idx]
-    return result[result["match_score"] > 0].reset_index(drop=True)
+    return result[result["match_score"] > 0.05].reset_index(drop=True)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -402,44 +402,34 @@ def _load_cuisines_for_city(city: str) -> list[str]:
 # Neighborhood naming
 # ---------------------------------------------------------------------------
 
-@st.cache_resource
-def _get_geocoder_and_cache():
-    """Persist both the rate-limited geocoder and result dict across rerenders."""
-    geolocator = geopy.geocoders.Nominatim(user_agent="citybite-dashboard")
-    geocoder = geopy.extra.rate_limiter.RateLimiter(geolocator.reverse, min_delay_seconds=1.0)
-    return geocoder, {}
+_geocode_cache: dict = {}
+_nominatim = geopy.geocoders.Nominatim(user_agent="citybite-dashboard", timeout=5)
 
 
 def _reverse_geocode_cell(lat: float, lng: float) -> str:
-    """Return a real neighborhood/suburb name, or '' to trigger compass fallback."""
+    """Return a real neighborhood name for a lat/lng, or '' on miss/error."""
     key = (round(lat, 4), round(lng, 4))
-    geocoder, cache = _get_geocoder_and_cache()
-    if key in cache:
-        return cache[key]
+    if key in _geocode_cache:
+        return _geocode_cache[key]
     try:
-        # zoom=14 targets the neighborhood/suburb level; higher zoom returns
-        # street-level data that misses named districts for many US cells.
-        result = geocoder(
-            f"{key[0]:.4f}, {key[1]:.4f}",
+        result = _nominatim.reverse(
+            f"{key[0]:.4f},{key[1]:.4f}",
             language="en",
             addressdetails=True,
             zoom=14,
         )
         if result is not None:
             addr = result.raw.get("address", {})
-            # Priority: most-specific named area first.
-            # Omit "city" — returns the metro name for cells inside city limits,
-            # causing unhelpful "Nashville 1", "Nashville 2" duplicates.
             for osm_key in (
                 "neighbourhood", "suburb", "quarter", "city_district",
                 "hamlet", "locality", "town", "village", "municipality",
             ):
                 if addr.get(osm_key):
-                    cache[key] = addr[osm_key]
-                    return cache[key]
+                    _geocode_cache[key] = addr[osm_key]
+                    return _geocode_cache[key]
     except Exception:
         pass
-    cache[key] = ""
+    _geocode_cache[key] = ""
     return ""
 
 
@@ -491,11 +481,18 @@ def _grid_cell_to_label(grid_cell: str, city_lat: float, city_lng: float) -> str
     return f"{direction} {suffix}"
 
 
+_TOP_N_GEOCODE = 10
+
+
 def add_neighborhood_labels(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add a 'neighborhood' column to any DataFrame that has
-    grid_cell, center_lat, and center_lng columns. Disambiguates duplicate
-    labels by appending a number.
+    Add a 'neighborhood' column to any DataFrame that has grid_cell,
+    center_lat, and center_lng columns. Disambiguates duplicate labels by
+    appending a number.
+
+    The top 10 cells by restaurant_count are reverse-geocoded via Nominatim
+    in parallel (all 10 fire simultaneously, completing in ~1–2s). Every
+    other cell gets an instant compass-direction label.
     """
     if df.empty or "grid_cell" not in df.columns:
         return df
@@ -503,12 +500,34 @@ def add_neighborhood_labels(df: pd.DataFrame) -> pd.DataFrame:
     city_lat = df["center_lat"].mean()
     city_lng = df["center_lng"].mean()
 
+    sort_col = next(
+        (c for c in ("restaurant_count", "avg_popularity") if c in df.columns),
+        None,
+    )
+    top_idx = set(
+        df.nlargest(_TOP_N_GEOCODE, sort_col).index
+        if sort_col is not None
+        else []
+    )
+
+    # Fire all geocode requests in parallel for the top cells
+    geocode_rows = {
+        idx: (round(float(row["center_lat"]), 4), round(float(row["center_lng"]), 4))
+        for idx, row in df.iterrows()
+        if idx in top_idx
+    }
+    geocode_results: dict = {}
+    with ThreadPoolExecutor(max_workers=_TOP_N_GEOCODE) as pool:
+        future_to_idx = {
+            pool.submit(_reverse_geocode_cell, lat, lng): idx
+            for idx, (lat, lng) in geocode_rows.items()
+        }
+        for future in as_completed(future_to_idx):
+            geocode_results[future_to_idx[future]] = future.result()
+
     raw = []
-    for _, row in df.iterrows():
-        name = _reverse_geocode_cell(
-            round(float(row["center_lat"]), 4),
-            round(float(row["center_lng"]), 4),
-        )
+    for idx, row in df.iterrows():
+        name = geocode_results.get(idx, "") or ""
         if not name:
             name = _grid_cell_to_label(row["grid_cell"], city_lat, city_lng)
         raw.append(name)
@@ -537,12 +556,12 @@ _MED_SCORE  = 0.4
 
 
 def _score_color(norm: float) -> str:
-    """Traffic-light color from a normalized [0,1] popularity score."""
+    """Heat-map color from a normalized [0,1] popularity score (red = hot)."""
     if norm >= _HIGH_SCORE:
-        return "#c62828"   # deep red — hotspot
+        return "#c62828"   # deep red — very popular
     if norm >= _MED_SCORE:
         return "#ef6c00"   # amber — moderate
-    return "#2e7d32"       # green — quiet
+    return "#2e7d32"       # green — low traffic
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -636,6 +655,10 @@ def build_map(
     ).add_to(m)
 
     if businesses_df is not None and not businesses_df.empty:
+        biz_scores = businesses_df["popularity_score"].fillna(0).astype(float)
+        biz_min = biz_scores.min()
+        biz_range = max(biz_scores.max() - biz_min, 1e-6)
+
         cluster = MarkerCluster(name="Restaurants").add_to(m)
         for _, biz in businesses_df.iterrows():
             try:
@@ -647,12 +670,13 @@ def build_map(
                 continue
 
             score = float(biz.get("popularity_score", 0.0) or 0.0)
-            if score >= _HIGH_SCORE:
-                icon_color = "red"
-            elif score >= _MED_SCORE:
+            norm = (score - biz_min) / biz_range
+            if norm >= _HIGH_SCORE:
+                icon_color = "green"
+            elif norm >= _MED_SCORE:
                 icon_color = "orange"
             else:
-                icon_color = "green"
+                icon_color = "lightgray"
 
             popup_html = (
                 f"<div style='font-family:sans-serif;min-width:190px'>"
@@ -746,12 +770,12 @@ def build_map(
         "box-shadow:0 2px 8px rgba(0,0,0,0.18);font-family:sans-serif;"
         "font-size:12px;line-height:2'>"
         "<b>Popularity</b><br>"
-        "<span style='background:#c62828;display:inline-block;width:12px;"
-        "height:12px;border-radius:2px;margin-right:6px'></span>High<br>"
-        "<span style='background:#ef6c00;display:inline-block;width:12px;"
-        "height:12px;border-radius:2px;margin-right:6px'></span>Medium<br>"
         "<span style='background:#2e7d32;display:inline-block;width:12px;"
-        "height:12px;border-radius:2px;margin-right:6px'></span>Low"
+        "height:12px;border-radius:2px;margin-right:6px'></span>Popular<br>"
+        "<span style='background:#ef6c00;display:inline-block;width:12px;"
+        "height:12px;border-radius:2px;margin-right:6px'></span>Moderate<br>"
+        "<span style='background:#9e9e9e;display:inline-block;width:12px;"
+        "height:12px;border-radius:2px;margin-right:6px'></span>Quiet"
         "</div>"
     )
     m.get_root().html.add_child(folium.Element(legend_html))
@@ -805,9 +829,9 @@ def render_map_panel(city: str) -> None:
             "<div style='padding-top:28px;font-size:12px;line-height:1.9;white-space:nowrap'>"
             "<span style='font-size:11px;font-weight:600;text-transform:uppercase;"
             "letter-spacing:.05em;color:#aaa'>Key</span><br>"
-            "<span style='color:#c62828'>&#9632;</span> High &nbsp;"
-            "<span style='color:#ef6c00'>&#9632;</span> Med &nbsp;"
-            "<span style='color:#2e7d32'>&#9632;</span> Low"
+            "<span style='color:#2e7d32'>&#9632;</span> Popular &nbsp;"
+            "<span style='color:#ef6c00'>&#9632;</span> Moderate &nbsp;"
+            "<span style='color:#9e9e9e'>&#9632;</span> Quiet"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -824,10 +848,8 @@ def render_map_panel(city: str) -> None:
         f"{len(biz_df):,}",
         help=f"Top {min(pin_count, len(biz_df))} pinned on map",
     )
-    c3.metric(
-        "Avg popularity",
-        f"{biz_df['popularity_score'].mean():.2f}" if not biz_df.empty else "—",
-    )
+    avg_rating = f"⭐ {biz_df['avg_rating'].mean():.1f} / 5" if not biz_df.empty else "—"
+    c3.metric("Avg Rating", avg_rating)
 
     label = f"Top restaurants — {city}"
     if cuisine_filter != "All":
@@ -929,7 +951,7 @@ def render_recommendations_panel(city: str) -> None:
         empty = 5 - full
         stars = "★" * full + "☆" * empty
 
-        predicted = float(row["predicted_rating"])
+        predicted = min(float(row["predicted_rating"]), 5.0)
         match_pct = min(int(predicted / 5 * 100), 100)
 
         st.markdown(
@@ -986,7 +1008,6 @@ def render_nlp_panel(city: str) -> None:
         rating = float(row.get("avg_rating") or 0.0)
         full  = min(round(rating), 5)
         stars = "★" * full + "☆" * (5 - full)
-        # final_score is already in [0,1] — show it directly so bars reflect true spread
         match_pct = min(int(float(row["final_score"]) * 100), 100)
 
         st.markdown(
@@ -1067,48 +1088,10 @@ def render_sentiment_panel(city: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Geocache pre-warm
-# ---------------------------------------------------------------------------
-
-@st.cache_resource
-def _start_geocache_prewarm():
-    """Background thread: geocode every grid cell on startup so the sentiment
-    tab loads instantly when the user picks a city."""
-    import threading
-
-    def _run():
-        try:
-            engine = get_engine()
-            with engine.connect() as conn:
-                cities = pd.read_sql(
-                    text("SELECT DISTINCT metro_area FROM business_scores ORDER BY metro_area"),
-                    conn,
-                )["metro_area"].tolist()
-            for city in cities:
-                with engine.connect() as conn:
-                    grid_df = pd.read_sql(
-                        text("SELECT center_lat, center_lng FROM grid_aggregates WHERE metro_area = :city"),
-                        conn,
-                        params={"city": city},
-                    )
-                for _, row in grid_df.iterrows():
-                    _reverse_geocode_cell(
-                        round(float(row["center_lat"]), 4),
-                        round(float(row["center_lng"]), 4),
-                    )
-        except Exception:
-            pass
-
-    threading.Thread(target=_run, daemon=True).start()
-    return True
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    _start_geocache_prewarm()
     selected_city = render_sidebar()
 
     tab_map, tab_recs, tab_nlp, tab_sentiment = st.tabs(
