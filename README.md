@@ -685,7 +685,7 @@ Sample data seed is fixed in `generate_sample.py` (`random.seed(42)`) for reprod
 ## AI Assistance Disclosure
 
 Portions of this project used Claude Code (Anthropic) as a coding assistant under the
-[course AI policy](https://www.vanderbilt.edu). AI assistance was used for the following
+assignment's AI policy. AI assistance was used for the following
 **permitted uses**:
 
 | Use | What the agent produced | How we validated it |
