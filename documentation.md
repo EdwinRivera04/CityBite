@@ -1,7 +1,7 @@
 # CityBite — Project Documentation
 
 **Course:** CS 4266 — Big Data Systems, Vanderbilt University  
-**Authors:** Syeda Ali (Person B — ML & Visualization) · Edwin Rivera (Person A — Infrastructure & Pipeline)  
+**Authors:** Syed Ali (Person B — ML & Visualization) · Edwin Rivera (Person A — Infrastructure & Pipeline)  
 **Stack:** AWS S3 · EMR · RDS PostgreSQL · PySpark · scikit-learn · Streamlit · Folium
 
 ---
